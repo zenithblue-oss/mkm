@@ -76,10 +76,7 @@ object GpuProvider {
                     line.startsWith("MIN_FREQ=") -> minFreq = line.removePrefix("MIN_FREQ=").trim().toLongOrNull() ?: 0L
                     line.startsWith("MAX_FREQ=") -> maxFreq = line.removePrefix("MAX_FREQ=").trim().toLongOrNull() ?: 0L
                     line.startsWith("TARGET_FREQ=") -> targetFreq = line.removePrefix("TARGET_FREQ=").trim().toLongOrNull() ?: 0L
-                    line.startsWith("LOAD=") -> {
-                        val raw = line.removePrefix("LOAD=").trim().toFloatOrNull() ?: 0f
-                        load = if (raw > 1f) raw / 100f else raw
-                    }
+                    line.startsWith("LOAD=") -> load = parseLoad(line.removePrefix("LOAD="))
                 }
             }
         }
@@ -377,7 +374,20 @@ object GpuProvider {
         else -> "Unknown"
     }
 
-    private fun formatRawFrequency(raw: Long): String = ShellUtils.formatFreq(if (raw > 10_000_000L) raw / 1000L else raw)
+    private fun formatRawFrequency(raw: Long): String = ShellUtils.formatFreq(rawFrequencyToKhz(raw))
+
+    // Same unit inference as GpuFrequencyDiscovery: <10k MHz, <10M kHz, else Hz.
+    internal fun rawFrequencyToKhz(raw: Long): Long = when {
+        raw < 10_000L -> raw * 1000L
+        raw < 10_000_000L -> raw
+        else -> raw / 1000L
+    }
+
+    /** Load text -> 0..1. Accepts "45", "45%", "45 12 0" (GED), "45@850000000Hz" (devfreq). */
+    internal fun parseLoad(text: String): Float {
+        val pct = text.trim().split(Regex("[\\s@%]+")).firstOrNull()?.toFloatOrNull() ?: 0f
+        return (pct / 100f).coerceIn(0f, 1f)
+    }
 
     private fun getGpuModel(): String {
         cachedGpuModel?.let { return it }

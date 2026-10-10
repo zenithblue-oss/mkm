@@ -282,7 +282,12 @@ class OverlayService : Service() {
                 
                 data?.let { h ->
                     updateHistory("cpu_usage", h.cpu.overallUsage)
-                    updateHistory("cpu_freq", h.cpu.overallUsage) 
+                    // Average cur/max across clusters (hwMaxFreq is kHz; currentFreq is formatted text).
+                    val freqRatios = h.cpu.clusters.mapNotNull { c ->
+                        val maxKhz = c.hwMaxFreq.toLongOrNull()?.takeIf { it > 0L } ?: c.rawMaxFreq.toLongOrNull()?.takeIf { it > 0L }
+                        maxKhz?.let { (parseFreqMHz(c.currentFreq) * 1000f / it).coerceIn(0f, 1f) }
+                    }
+                    updateHistory("cpu_freq", if (freqRatios.isEmpty()) 0f else freqRatios.average().toFloat())
                     updateHistory("gpu_usage", h.gpu.loadPercent)
                     updateHistory("ram_usage", h.memory.usagePercent)
                     updateHistory("swap_usage", h.swap.usagePercent)

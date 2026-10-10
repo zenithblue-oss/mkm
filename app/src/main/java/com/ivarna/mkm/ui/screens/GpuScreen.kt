@@ -314,7 +314,5 @@ fun GpuScreen(viewModel: GpuViewModel = viewModel(), onOpenDrawer: () -> Unit = 
 
 private fun formatFreq(freq: String): String {
     val f = freq.toLongOrNull() ?: return freq
-    // Mali freqs are usually in Hz if they are that large (> 10MHz)
-    val khz = if (f > 10000000) f / 1000 else f
-    return ShellUtils.formatFreq(khz)
+    return ShellUtils.formatFreq(com.ivarna.mkm.data.provider.GpuProvider.rawFrequencyToKhz(f))
 }

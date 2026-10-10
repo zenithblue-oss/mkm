@@ -128,7 +128,21 @@ object GpuScripts {
             FREQ_AVAILABLE=0
             BASE=$(basename "$path")
             SOC_ADDR=$(echo "${'$'}BASE" | cut -d. -f1)
+            # MediaTek: devfreq cur_freq can stay pinned at the lowest OPP while GED/gpufreq
+            # DVFS moves the real clock. GED prints "<opp-index> <kHz>"; use the last field.
+            # Preference: gpufreqv2 status, then ged, then devfreq (loop below).
+            # On Dimensity 8300 devfreq AND ged current_freqency stay frozen at the lowest OPP
+            # (verified on device under load); only gpufreqv2 "[GPU   OPP] Index: N, Freq: <kHz>" moves.
+            GED=$(sed -n 's/^\[GPU   OPP\].*Freq: *\([0-9][0-9]*\).*/\1/p' /proc/gpufreqv2/gpufreq_status 2>/dev/null | head -n 1)
+            if ! [ "${'$'}{GED:-0}" -gt 0 ] 2>/dev/null; then
+                GED=$(cat /sys/kernel/ged/hal/current_freqency 2>/dev/null | awk '{print ${'$'}NF}')
+            fi
+            if [ -n "${'$'}GED" ] && [ "${'$'}GED" -gt 0 ] 2>/dev/null; then
+                CUR_FREQ="${'$'}GED"
+                FREQ_AVAILABLE=1
+            fi
             for f in "$path/cur_freq" "$path/cur_frequency" "$(dirname "$path")/cur_freq" "/sys/class/kgsl/kgsl-3d0/gpuclk" "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq" "/sys/class/devfreq/kgsl-3d0/cur_freq" "/sys/class/devfreq/${'$'}BASE/cur_freq" "/sys/devices/platform/soc/${'$'}SOC_ADDR/kgsl/kgsl-3d0/gpuclk" "/sys/devices/platform/soc/${'$'}SOC_ADDR/kgsl/kgsl-3d0/devfreq/cur_freq"; do
+                [ -n "${'$'}CUR_FREQ" ] && break
                 v=$(cat "${'$'}f" 2>/dev/null | tr -d '[:space:]')
                 if [ -n "${'$'}v" ] && [ "${'$'}v" != "0" ]; then
                     CUR_FREQ="${'$'}v"
@@ -171,12 +185,18 @@ object GpuScripts {
                     fi
                 elif echo "$path" | grep -q "kgsl"; then
                      # Adreno gpubusy - usually at ../gpubusy relative to devfreq
-                     PARENT=$(dirname "$path")
-                     if [ -f "${'$'}PARENT/gpubusy" ]; then
-                         read busy total < "${'$'}PARENT/gpubusy"
-                         if [ "${'$'}total" -gt 0 ]; then
-                             LOAD=$((${'$'}busy * 100 / ${'$'}total))
+                     # gpubusy lives under /sys/class/kgsl/kgsl-3d0, not the devfreq parent.
+                     for GB in "/sys/class/kgsl/kgsl-3d0/gpubusy" "$(dirname "$path")/gpubusy"; do
+                         if [ -f "${'$'}GB" ]; then
+                             read busy total < "${'$'}GB"
+                             if [ "${'$'}{total:-0}" -gt 0 ] 2>/dev/null; then
+                                 LOAD=$((${'$'}busy * 100 / ${'$'}total))
+                             fi
+                             break
                          fi
+                     done
+                     if [ "${'$'}LOAD" = "0" ] && [ -f "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage" ]; then
+                         LOAD=$(cat "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage" | tr -d '% ')
                      fi
                 fi
             fi
