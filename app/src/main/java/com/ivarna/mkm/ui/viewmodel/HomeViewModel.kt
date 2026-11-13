@@ -4,13 +4,18 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.ivarna.mkm.data.HomeData
 import com.ivarna.mkm.data.SystemRepository
-import com.ivarna.mkm.util.AppVisibilityMonitor
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
+/**
+ * Activity-scoped (the drawer reads access state from it), but it only polls
+ * while HomeScreen is resumed: see [startPolling]/[stopPolling].
+ */
 class HomeViewModel(private val repository: SystemRepository = SystemRepository()) : ViewModel() {
     private val _uiState = MutableStateFlow<HomeData?>(null)
     val uiState: StateFlow<HomeData?> = _uiState.asStateFlow()
@@ -18,23 +23,28 @@ class HomeViewModel(private val repository: SystemRepository = SystemRepository(
     private val _isRefreshing = MutableStateFlow(false)
     val isRefreshing: StateFlow<Boolean> = _isRefreshing.asStateFlow()
 
+    private var pollJob: Job? = null
+
     init {
-        startMonitoring()
+        // One load so the drawer knows the access state even before Home is shown.
+        viewModelScope.launch { _uiState.value = repository.getHomeData() }
     }
 
-    private fun startMonitoring() {
-        viewModelScope.launch {
-            while (true) {
-                if (AppVisibilityMonitor.isForeground.value) {
-                    _uiState.value = repository.getHomeData()
-                    delay(2000)
-                } else {
-                    delay(5000)
-                }
+    fun startPolling() {
+        if (pollJob?.isActive == true) return
+        pollJob = viewModelScope.launch {
+            while (isActive) {
+                _uiState.value = repository.getHomeData()
+                delay(2000)
             }
         }
     }
-    
+
+    fun stopPolling() {
+        pollJob?.cancel()
+        pollJob = null
+    }
+
     fun refresh() {
         viewModelScope.launch {
             _isRefreshing.value = true

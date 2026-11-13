@@ -69,6 +69,11 @@ fun HomeScreen(
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val isRefreshing by viewModel.isRefreshing.collectAsState()
+    // Poll only while Home is visible and resumed (GH #3: MKM's own battery drain).
+    androidx.lifecycle.compose.LifecycleResumeEffect(viewModel) {
+        viewModel.startPolling()
+        onPauseOrDispose { viewModel.stopPolling() }
+    }
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
     Scaffold(

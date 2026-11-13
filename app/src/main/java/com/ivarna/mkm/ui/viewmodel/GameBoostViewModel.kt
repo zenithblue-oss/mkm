@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.ivarna.mkm.data.model.GameBoostCapabilities
 import com.ivarna.mkm.data.model.GameBoostState
 import com.ivarna.mkm.service.BootSettingsManager
+import com.ivarna.mkm.service.GameBoostAutoBoost
 import com.ivarna.mkm.service.GameBoostManager
 import com.ivarna.mkm.service.GameBoostRegistry
 import com.ivarna.mkm.service.GameBoostService
@@ -36,6 +37,33 @@ class GameBoostViewModel(application: Application) : AndroidViewModel(applicatio
             state.collectLatest { current ->
                 if (current !is GameBoostState.Off) GameBoostService.ensureRunning(getApplication())
             }
+        }
+    }
+
+    private val _autoEnabled = MutableStateFlow(GameBoostAutoBoost.isEnabled(application))
+    val autoEnabled: StateFlow<Boolean> = _autoEnabled.asStateFlow()
+    private val _autoPackages = MutableStateFlow(GameBoostAutoBoost.packages(application))
+    val autoPackages: StateFlow<Set<String>> = _autoPackages.asStateFlow()
+    private val _apps = MutableStateFlow<List<GameBoostAutoBoost.App>?>(null)
+    val apps: StateFlow<List<GameBoostAutoBoost.App>?> = _apps.asStateFlow()
+
+    fun setAutoEnabled(enabled: Boolean) {
+        _autoEnabled.value = enabled
+        GameBoostAutoBoost.setEnabled(getApplication(), enabled)
+        // The service hosts the watcher; it stays up only while needed.
+        if (enabled) GameBoostService.start(getApplication())
+        else if (!GameBoostRegistry.ownsTuning()) GameBoostService.stop(getApplication())
+    }
+
+    fun setAutoPackages(packages: Set<String>) {
+        _autoPackages.value = packages
+        GameBoostAutoBoost.setPackages(getApplication(), packages)
+    }
+
+    fun loadApps() {
+        if (_apps.value != null) return
+        viewModelScope.launch(Dispatchers.IO) {
+            _apps.value = runCatching { GameBoostAutoBoost.launcherApps(getApplication()) }.getOrDefault(emptyList())
         }
     }
 
@@ -80,7 +108,7 @@ class GameBoostViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch(Dispatchers.IO) {
             val result = manager.retryRecovery()
             if (result is GameBoostTransitionResult.Failure) _message.value = result.reason
-            else if (!GameBoostRegistry.ownsTuning()) GameBoostService.stop(getApplication())
+            if (!GameBoostRegistry.ownsTuning()) GameBoostService.stop(getApplication())
         }
     }
 

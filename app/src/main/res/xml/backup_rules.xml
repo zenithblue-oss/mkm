@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Boot tuning and live Game Boost sessions are device-specific: never restore them onto another boot/device. -->
+<full-backup-content>
+    <exclude domain="sharedpref" path="mkm_boot_settings.xml" />
+    <exclude domain="sharedpref" path="game_boost_session.xml" />
+    <exclude domain="sharedpref" path="mkm_memory_boot.xml" />
+</full-backup-content>

@@ -18,13 +18,20 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import android.os.PowerManager
+import com.ivarna.mkm.shell.ShellManager
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Keeps Game Boost ownership and thermal release monitoring alive outside the UI. */
 class GameBoostService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var thermalGuard: GameBoostThermalGuard? = null
+    private var watcherJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -35,7 +42,10 @@ class GameBoostService : Service() {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else startForeground(NOTIFICATION_ID, notification)
 
-        val guard = GameBoostThermalGuard(this, scope) { status ->
+        val guard = GameBoostThermalGuard(
+            this, scope,
+            onUnavailable = { GameBoostRegistry.manager(this@GameBoostService).onThermalMonitoringUnavailable() }
+        ) { status ->
             GameBoostRegistry.manager(this@GameBoostService).onThermalStatus(status)
         }
         val guardResult = guard.start()
@@ -66,17 +76,54 @@ class GameBoostService : Service() {
             val snapshot = store.load()
             if (snapshot == null || !store.isSameBoot(snapshot)) {
                 snapshot?.let { store.clear() }
-                stopSelf(startId)
-                return START_NOT_STICKY
+                if (!GameBoostAutoBoost.isEnabled(this)) {
+                    stopSelf(startId)
+                    return START_NOT_STICKY
+                }
             }
+        }
+        if (GameBoostAutoBoost.isEnabled(this) && watcherJob?.isActive != true) {
+            watcherJob = scope.launch { watchForeground() }
         }
         return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /**
+     * Per-app auto boost. Polls the resumed activity every 3s while the screen is on;
+     * screen off counts as leaving the game. Thermal safety stays with the guard and
+     * [GameBoostManager]: a ThermalLimited session is never relocked here.
+     * ponytail: 3s dumpsys poll; switch to a UsageStats/accessibility event source if battery cost shows up.
+     */
+    private suspend fun watchForeground() {
+        val manager = GameBoostRegistry.manager(this)
+        val power = getSystemService(PowerManager::class.java)
+        var previous: String? = null
+        var autoOwned = false
+        while (scope.isActive && GameBoostAutoBoost.isEnabled(this)) {
+            val foreground = if (power?.isInteractive != false) {
+                val result = withContext(Dispatchers.IO) { ShellManager.execElevated(GameBoostAutoBoost.FOREGROUND_COMMAND) }
+                GameBoostAutoBoost.parseForegroundPackage(result.stdout)
+            } else null
+            val state = GameBoostRegistry.state.value
+            if (state is GameBoostState.Off) autoOwned = false
+            when (GameBoostAutoBoost.decide(foreground, previous, GameBoostAutoBoost.packages(this), state is GameBoostState.Off, autoOwned)) {
+                GameBoostAutoBoost.Action.ENABLE ->
+                    autoOwned = withContext(Dispatchers.IO) { manager.enable() } is GameBoostTransitionResult.Success
+                GameBoostAutoBoost.Action.DISABLE -> {
+                    if (withContext(Dispatchers.IO) { manager.disable() } is GameBoostTransitionResult.Success) autoOwned = false
+                }
+                GameBoostAutoBoost.Action.NONE -> Unit
+            }
+            previous = foreground
+            delay(WATCH_INTERVAL_MS)
+        }
+    }
+
     override fun onDestroy() {
         ready.set(false)
+        watcherJob?.cancel()
         thermalGuard?.stop()
         thermalGuard = null
         scope.cancel()
@@ -93,6 +140,7 @@ class GameBoostService : Service() {
         val textRes = when (state) {
             is GameBoostState.ThermalLimited -> R.string.game_boost_notification_thermal
             is GameBoostState.RecoveryRequired -> R.string.game_boost_notification_recovery
+            GameBoostState.Off -> R.string.game_boost_notification_watching
             else -> R.string.game_boost_notification_active
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
@@ -120,6 +168,7 @@ class GameBoostService : Service() {
         const val ACTION_OPEN_GAME_BOOST = "com.ivarna.mkm.action.OPEN_GAME_BOOST"
         const val CHANNEL_ID = "mkm_game_boost_channel"
         const val NOTIFICATION_ID = 3002
+        private const val WATCH_INTERVAL_MS = 3_000L
         private val ready = AtomicBoolean(false)
 
         fun start(context: Context) {
@@ -137,7 +186,9 @@ class GameBoostService : Service() {
             return ready.get()
         }
 
+        /** No-op while auto boost is on: the service hosts the foreground watcher. */
         fun stop(context: Context) {
+            if (GameBoostAutoBoost.isEnabled(context)) return
             context.stopService(Intent(context, GameBoostService::class.java).setAction(ACTION_STOP))
         }
     }

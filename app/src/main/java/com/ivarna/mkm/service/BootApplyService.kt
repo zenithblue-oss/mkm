@@ -14,9 +14,8 @@ import com.ivarna.mkm.R
 import com.ivarna.mkm.data.model.ApplyResult
 import com.ivarna.mkm.data.provider.CpuProvider
 import com.ivarna.mkm.data.provider.GpuProvider
-import com.ivarna.mkm.shell.DevfreqScripts
-import com.ivarna.mkm.shell.ShellManager
-import com.ivarna.mkm.shell.UfsScripts
+import android.app.PendingIntent
+import com.ivarna.mkm.shell.SysfsTuningExecutor
 import kotlinx.coroutines.*
 
 /**
@@ -32,11 +31,14 @@ class BootApplyService : Service() {
         const val ACTION_START = "com.ivarna.mkm.action.START_BOOT_APPLY"
         const val CHANNEL_ID = "mkm_boot_channel"
         const val NOTIFICATION_ID = 3001
+        const val ACTION_CANCEL = "com.ivarna.mkm.action.CANCEL_BOOT_APPLY"
         const val COUNTDOWN_SECONDS = 10
+        private const val SAFE_MODE_NOTIFICATION_ID = 3003
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var applyJob: Job? = null
+    @Volatile private var applying = false
 
     override fun onCreate() {
         super.onCreate()
@@ -44,8 +46,14 @@ class BootApplyService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_START) {
-            startCountdownAndApply()
+        when (intent?.action) {
+            ACTION_START -> if (applyJob?.isActive != true) startCountdownAndApply()
+            ACTION_CANCEL -> if (!applying) {
+                // Countdown only: nothing has been written yet.
+                applyJob?.cancel()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
         }
         return START_NOT_STICKY
     }
@@ -74,15 +82,29 @@ class BootApplyService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         }
 
+        // Boot safe mode: the previous apply never reached its stability window
+        // (crash or reboot mid-apply). Do not replay it; turn apply-on-boot off.
+        val attempts = BootSettingsManager.applyAttempts(this)
+        if (BootSafeMode.shouldTrip(BootSettingsManager.isApplyInProgress(this), attempts)) {
+            BootSettingsManager.disableAllAndReset(this)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            notifySafeMode(attempts)
+            stopSelf()
+            return
+        }
+
         applyJob = serviceScope.launch {
             for (secondsRemaining in COUNTDOWN_SECONDS downTo 1) {
                 updateNotification(secondsRemaining)
                 delay(1000L)
             }
 
+            applying = true
+            BootSettingsManager.markApplyStarted(this@BootApplyService)
             val summary = applyAllSettings()
             updateNotificationDone(summary)
-            delay(3000L)
+            delay(BootSafeMode.STABILITY_WINDOW_MS)
+            BootSettingsManager.markApplyStable(this@BootApplyService)
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
@@ -152,45 +174,74 @@ class BootApplyService : Service() {
                 }
             }
 
-            // RAM (DDR devfreq)
+            // RAM (DDR devfreq) and storage (UFS): only validated, read-back
+            // writes through SysfsTuningExecutor (root first, never a raw script).
             if (BootSettingsManager.isRamEnabled(this@BootApplyService)) {
                 BootSettingsManager.loadRamSettings(this@BootApplyService)?.let { ram ->
-                    if (ram.governor.isNotBlank()) {
-                        if (!ShellManager.exec(DevfreqScripts.setGovernor(ram.controllerPath, ram.governor)).isSuccess) failures += "RAM governor"
-                    }
-                    if (ram.freq.isNotBlank()) {
-                        if (!ShellManager.exec(DevfreqScripts.setFreq(ram.controllerPath, ram.freq)).isSuccess) failures += "RAM frequency"
+                    val path = ram.controllerPath
+                    if (ram.governor.isNotBlank()) writeVerified("$path/governor", ram.governor, "RAM governor", failures, adjustments)
+                    if (isSavedFreq(ram.freq)) {
+                        val setFreq = "$path/userspace/set_freq"
+                        if (ram.governor == "userspace" && SysfsTuningExecutor.exists(setFreq)) {
+                            if (!SysfsTuningExecutor.write(setFreq, ram.freq).isSuccess) failures += "RAM frequency"
+                        } else {
+                            writeVerified("$path/max_freq", ram.freq, "RAM maximum frequency", failures, adjustments)
+                            writeVerified("$path/min_freq", ram.freq, "RAM minimum frequency", failures, adjustments)
+                        }
                     }
                 }
             }
 
-            // Storage (UFS)
             if (BootSettingsManager.isStorageEnabled(this@BootApplyService)) {
                 BootSettingsManager.loadStorageSettings(this@BootApplyService)?.let { storage ->
-                    if (storage.governor.isNotBlank()) {
-                        if (!ShellManager.exec(UfsScripts.setGovernor(storage.controllerPath, storage.governor)).isSuccess) failures += "Storage governor"
-                    }
-                    if (storage.minFreq.isNotBlank()) {
-                        if (!ShellManager.exec(UfsScripts.setMinFreq(storage.controllerPath, storage.minFreq)).isSuccess) failures += "Storage minimum frequency"
-                    }
-                    if (storage.maxFreq.isNotBlank()) {
-                        if (!ShellManager.exec(UfsScripts.setMaxFreq(storage.controllerPath, storage.maxFreq)).isSuccess) failures += "Storage maximum frequency"
-                    }
+                    val path = storage.controllerPath
+                    if (storage.governor.isNotBlank()) writeVerified("$path/governor", storage.governor, "Storage governor", failures, adjustments)
+                    if (isSavedFreq(storage.maxFreq)) writeVerified("$path/max_freq", storage.maxFreq, "Storage maximum frequency", failures, adjustments)
+                    if (isSavedFreq(storage.minFreq)) writeVerified("$path/min_freq", storage.minFreq, "Storage minimum frequency", failures, adjustments)
                 }
             }
 
-            // Game Boost (global performance session)
+            // Memory (swap/zram/VM) boot tuning. MemoryBootTuning does not take
+            // the (non-reentrant) coordinator lock, so it runs inside this one.
+            failures += runCatching { MemoryBootTuning.apply(this@BootApplyService) }
+                .getOrElse { listOf("Memory (${it.message})") }
+            }
+
+            // Game Boost (global performance session). enable() takes the
+            // coordinator lock itself, so it must run after withMutation returns.
             if (BootSettingsManager.isGameBoostEnabled(this@BootApplyService)) {
                 GameBoostService.start(this@BootApplyService)
-                val manager = GameBoostRegistry.manager(this@BootApplyService)
-                val result = manager.enable()
+                val result = if (!GameBoostService.awaitReady()) {
+                    GameBoostTransitionResult.Failure("Game Boost foreground service could not start")
+                } else GameBoostRegistry.manager(this@BootApplyService).enable()
                 if (result is GameBoostTransitionResult.Failure) {
                     failures += "Game Boost (${result.reason})"
                 }
             }
-            }
         }
         return ApplySummary(failures = failures, adjustments = adjustments)
+    }
+
+    /** Saved "0"/blank means "not set" for devfreq frequencies. */
+    private fun isSavedFreq(value: String) = value.isNotBlank() && value.trim() != "0"
+
+    private fun writeVerified(
+        path: String,
+        value: String,
+        label: String,
+        failures: MutableList<String>,
+        adjustments: MutableList<String>
+    ) {
+        val result = SysfsTuningExecutor.write(path, value)
+        if (!result.isSuccess) {
+            failures += label
+            return
+        }
+        val actual = SysfsTuningExecutor.read(path)
+        when {
+            actual.isBlank() -> failures += "$label (read-back unavailable)"
+            actual != value -> adjustments += "$label ($actual)"
+        }
     }
 
     // ------------------------------------------------------------------
@@ -213,11 +264,17 @@ class BootApplyService : Service() {
     }
 
     private fun buildCountdownNotification(seconds: Int): Notification {
+        val cancelIntent = PendingIntent.getService(
+            this, 0,
+            Intent(this, BootApplyService::class.java).setAction(ACTION_CANCEL),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_battery)
             .setContentTitle("MKM Boot Settings")
             .setContentText("Applying settings in ${seconds}s...")
             .setProgress(COUNTDOWN_SECONDS, COUNTDOWN_SECONDS - seconds, false)
+            .addAction(0, getString(R.string.boot_apply_cancel), cancelIntent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -227,18 +284,21 @@ class BootApplyService : Service() {
 
     private fun updateNotification(secondsRemaining: Int) {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val elapsed = COUNTDOWN_SECONDS - secondsRemaining
+        nm.notify(NOTIFICATION_ID, buildCountdownNotification(secondsRemaining))
+    }
+
+    private fun notifySafeMode(attempts: Int) {
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val text = getString(R.string.boot_safe_mode_text, attempts)
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_battery)
-            .setContentTitle("MKM Boot Settings")
-            .setContentText("Applying settings in ${secondsRemaining}s...")
-            .setProgress(COUNTDOWN_SECONDS, elapsed, false)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .setShowWhen(false)
+            .setContentTitle(getString(R.string.boot_safe_mode_title))
+            .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setAutoCancel(true)
             .build()
-        nm.notify(NOTIFICATION_ID, notification)
+        nm.notify(SAFE_MODE_NOTIFICATION_ID, notification)
     }
 
     private fun updateNotificationDone(summary: ApplySummary) {

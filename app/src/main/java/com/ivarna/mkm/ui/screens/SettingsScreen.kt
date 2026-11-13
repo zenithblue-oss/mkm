@@ -28,6 +28,9 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ivarna.mkm.R
 import com.ivarna.mkm.service.BatteryMonitorService
 import com.ivarna.mkm.service.BatterySessionTracker
+import com.ivarna.mkm.service.BootSettingsManager
+import com.ivarna.mkm.service.GameBoostAutoBoost
+import com.ivarna.mkm.service.TuningProfile
 import com.ivarna.mkm.shell.ShellManager
 import com.ivarna.mkm.ui.components.*
 import com.ivarna.mkm.ui.viewmodel.AppLocale
@@ -59,8 +62,37 @@ fun SettingsScreen(
 
     var showThemeDialog by remember { mutableStateOf(false) }
     var showLanguageDialog by remember { mutableStateOf(false) }
-    val localeCode = remember { LocaleHelper.getPersistedLocale(context) }
-    LaunchedEffect(Unit) { viewModel.setLocale(AppLocale.valueOf(localeCode)) }
+
+    // --- Tuning profile export/import ---
+    var pendingImport by remember { mutableStateOf<TuningProfile.Profile?>(null) }
+    val profileExportedMsg = stringResource(R.string.tuning_profile_exported)
+    val profileImportedMsg = stringResource(R.string.tuning_profile_imported)
+    fun profileError(e: Throwable) = context.getString(R.string.tuning_profile_failed, e.message ?: e.javaClass.simpleName)
+    val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        uri ?: return@rememberLauncherForActivityResult
+        coroutineScope.launch {
+            val message = withContext(Dispatchers.IO) {
+                runCatching {
+                    val json = TuningProfile.toJson(TuningProfile.read(context))
+                    context.contentResolver.openOutputStream(uri, "wt")!!.use { it.write(json.toByteArray()) }
+                }.fold({ profileExportedMsg }, ::profileError)
+            }
+            snackbarHostState.showSnackbar(message)
+        }
+    }
+    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri ?: return@rememberLauncherForActivityResult
+        coroutineScope.launch {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    val bytes = context.contentResolver.openInputStream(uri)!!.use { it.readNBytesCompat(MAX_PROFILE_BYTES + 1) }
+                    require(bytes.size <= MAX_PROFILE_BYTES) { "File too large" }
+                    TuningProfile.fromJson(String(bytes))
+                }
+            }.onSuccess { pendingImport = it }
+                .onFailure { snackbarHostState.showSnackbar(profileError(it)) }
+        }
+    }
 
     // --- Power Calibration state ---
     val savedMultiplier by powerViewModel.calibrationMultiplier.collectAsState()
@@ -540,6 +572,24 @@ fun SettingsScreen(
 
             item {
                 Spacer(modifier = Modifier.height(16.dp))
+                SettingsSection(title = stringResource(R.string.tuning_profile)) {
+                    SettingsItem(
+                        icon = Icons.Default.Upload,
+                        title = stringResource(R.string.tuning_profile_export),
+                        subtitle = stringResource(R.string.tuning_profile_export_desc),
+                        onClick = { exportLauncher.launch("mkm-tuning-profile.json") }
+                    )
+                    SettingsItem(
+                        icon = Icons.Default.Download,
+                        title = stringResource(R.string.tuning_profile_import),
+                        subtitle = stringResource(R.string.tuning_profile_import_desc),
+                        onClick = { importLauncher.launch(arrayOf("application/json", "text/plain", "application/octet-stream")) }
+                    )
+                }
+            }
+
+            item {
+                Spacer(modifier = Modifier.height(16.dp))
                 AboutMeCard(
                     name = stringResource(com.ivarna.mkm.R.string.abhay_raj),
                     handle = "@abhay-byte",
@@ -625,6 +675,38 @@ fun SettingsScreen(
         }
     }
 
+    pendingImport?.let { profile ->
+        val counts = profile.summary().counts
+        AlertDialog(
+            onDismissRequest = { pendingImport = null },
+            title = { Text(stringResource(R.string.tuning_profile_confirm_title)) },
+            text = {
+                Text(
+                    stringResource(
+                        R.string.tuning_profile_summary,
+                        counts[BootSettingsManager.PREFS_FILE] ?: 0,
+                        counts[GameBoostAutoBoost.PREFS] ?: 0,
+                        counts[TuningProfile.MEMORY_BOOT_PREFS] ?: 0,
+                        profile.rejected
+                    )
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = profile.files.isNotEmpty(),
+                    onClick = {
+                        pendingImport = null
+                        coroutineScope.launch {
+                            withContext(Dispatchers.IO) { TuningProfile.apply(context, profile) }
+                            snackbarHostState.showSnackbar(profileImportedMsg)
+                        }
+                    }
+                ) { Text(stringResource(R.string.tuning_profile_import_action)) }
+            },
+            dismissButton = { TextButton(onClick = { pendingImport = null }) { Text(stringResource(R.string.cancel)) } }
+        )
+    }
+
     val systemDefaultLabel = stringResource(com.ivarna.mkm.R.string.system_default)
     if (showLanguageDialog) {
         SelectionBottomSheet(
@@ -633,9 +715,7 @@ fun SettingsScreen(
             selectedItem = viewModel.locale.collectAsState().value.name,
             onDismiss = { showLanguageDialog = false },
             onItemSelected = {
-                val appLocale = AppLocale.valueOf(it)
-                viewModel.setLocale(appLocale)
-                LocaleHelper.persistLocale(context, appLocale.name)
+                viewModel.setLocale(AppLocale.valueOf(it))
                 (context as? android.app.Activity)?.recreate()
                 showLanguageDialog = false
             },
@@ -692,6 +772,20 @@ fun SettingsScreen(
 private fun rememberAppBuildInfo(): Triple<String, String, String> {
     val context = LocalContext.current
     return remember { AppBuildInfo.resolve(context) }
+}
+
+private const val MAX_PROFILE_BYTES = 256 * 1024
+
+/** Bounded read (InputStream.readNBytes is API 33+). */
+private fun java.io.InputStream.readNBytesCompat(limit: Int): ByteArray {
+    val out = java.io.ByteArrayOutputStream()
+    val buffer = ByteArray(8192)
+    while (out.size() < limit) {
+        val n = read(buffer, 0, minOf(buffer.size, limit - out.size()))
+        if (n < 0) break
+        out.write(buffer, 0, n)
+    }
+    return out.toByteArray()
 }
 
 private fun setBatteryNotification(context: Context, enabled: Boolean) {

@@ -298,8 +298,16 @@ fun PermissionRequestScreen(
 fun AccessMethodCard(
     onRequestShizukuPermission: () -> Unit
 ) {
-    val accessMethod = remember { com.ivarna.mkm.shell.ShellManager.getAvailableMethod() }
-    
+    // Shell.getShell() can block while the root shell starts: resolve it off the main thread.
+    // null = still checking (no LOCAL/"None" flash before the probe finishes).
+    val access = rememberAccessSnapshot()
+    val accessMethod = access?.method
+    val isRoot = accessMethod == com.ivarna.mkm.shell.ShellManager.AccessMethod.ROOT
+    val requestShizuku: () -> Unit = {
+        ShizukuManager.requestPermission()
+        onRequestShizukuPermission()
+    }
+
     ElevatedCard(
         modifier = Modifier
             .fillMaxWidth()
@@ -326,56 +334,67 @@ fun AccessMethodCard(
                 )
                 Text(
                     when (accessMethod) {
+                        null -> stringResource(com.ivarna.mkm.R.string.checking_status)
                         com.ivarna.mkm.shell.ShellManager.AccessMethod.ROOT -> stringResource(com.ivarna.mkm.R.string.root)
-                        com.ivarna.mkm.shell.ShellManager.AccessMethod.LOCAL -> stringResource(com.ivarna.mkm.R.string.none)
+                        com.ivarna.mkm.shell.ShellManager.AccessMethod.LOCAL ->
+                            if (access?.shizukuGranted == true) stringResource(com.ivarna.mkm.R.string.shizuku)
+                            else stringResource(com.ivarna.mkm.R.string.none)
                     },
                     style = MaterialTheme.typography.bodyLarge,
-                    color = when (accessMethod) {
-                        com.ivarna.mkm.shell.ShellManager.AccessMethod.ROOT -> MaterialTheme.colorScheme.primary
+                    color = when {
+                        accessMethod == null -> MaterialTheme.colorScheme.onSurfaceVariant
+                        isRoot || access?.shizukuGranted == true -> MaterialTheme.colorScheme.primary
                         else -> MaterialTheme.colorScheme.error
                     }
                 )
             }
-            
+
             Spacer(modifier = Modifier.height(16.dp))
-            
+
             // Shizuku status
-            val shizukuHidden = ShizukuManager.isHidden()
+            val shizukuHidden = access?.shizukuHidden == true
             AccessMethodItem(
                 icon = Icons.Default.Security,
                 title = if (shizukuHidden) stringResource(com.ivarna.mkm.R.string.shizuku_hidden) else stringResource(com.ivarna.mkm.R.string.shizuku),
                 status = when {
-                    ShizukuManager.hasPermission() -> stringResource(com.ivarna.mkm.R.string.active)
+                    access == null -> stringResource(com.ivarna.mkm.R.string.checking_status)
+                    access.shizukuGranted -> stringResource(com.ivarna.mkm.R.string.active)
                     shizukuHidden -> stringResource(com.ivarna.mkm.R.string.shizuku_hidden_grant)
-                    !ShizukuManager.isInstalled() -> stringResource(com.ivarna.mkm.R.string.not_installed)
-                    !ShizukuManager.isRunning() -> stringResource(com.ivarna.mkm.R.string.not_running)
-                    !ShizukuManager.hasPermission() -> stringResource(com.ivarna.mkm.R.string.shizuku_hidden)
-                    else -> stringResource(com.ivarna.mkm.R.string.active)
+                    !access.shizukuInstalled -> stringResource(com.ivarna.mkm.R.string.not_installed)
+                    !access.shizukuRunning -> stringResource(com.ivarna.mkm.R.string.not_running)
+                    else -> stringResource(com.ivarna.mkm.R.string.grant_permission)
                 },
                 statusColor = when {
-                    ShizukuManager.hasPermission() -> MaterialTheme.colorScheme.primary
-                    shizukuHidden -> MaterialTheme.colorScheme.tertiary
-                    !ShizukuManager.isInstalled() -> MaterialTheme.colorScheme.error
-                    !ShizukuManager.isRunning() -> MaterialTheme.colorScheme.tertiary
+                    access == null -> MaterialTheme.colorScheme.onSurfaceVariant
+                    access.shizukuGranted -> MaterialTheme.colorScheme.primary
+                    !access.shizukuInstalled && !shizukuHidden -> MaterialTheme.colorScheme.error
                     else -> MaterialTheme.colorScheme.tertiary
                 },
                 onClick = when {
-                    ShizukuManager.hasPermission() -> null
-                    shizukuHidden -> onRequestShizukuPermission
-                    !ShizukuManager.isInstalled() -> null
-                    !ShizukuManager.isRunning() -> null
-                    else -> onRequestShizukuPermission
+                    access == null || access.shizukuGranted -> null
+                    shizukuHidden -> requestShizuku
+                    !access.shizukuRunning -> null
+                    else -> requestShizuku
                 }
             )
-            
+            // Granted but commands fail: show the backend error so users can report it.
+            access?.shizukuError?.let { error ->
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    stringResource(com.ivarna.mkm.R.string.shizuku_backend_error, error),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+
             Spacer(modifier = Modifier.height(8.dp))
             
             // Root status
             AccessMethodItem(
                 icon = Icons.Default.Security,
                 title = stringResource(com.ivarna.mkm.R.string.root),
-                status = if (com.topjohnwu.superuser.Shell.getShell().isRoot) stringResource(com.ivarna.mkm.R.string.active) else stringResource(com.ivarna.mkm.R.string.not_available),
-                statusColor = if (com.topjohnwu.superuser.Shell.getShell().isRoot) {
+                status = if (isRoot) stringResource(com.ivarna.mkm.R.string.active) else stringResource(com.ivarna.mkm.R.string.not_available),
+                statusColor = if (isRoot) {
                     MaterialTheme.colorScheme.primary
                 } else {
                     MaterialTheme.colorScheme.error
@@ -384,6 +403,58 @@ fun AccessMethodCard(
             )
         }
     }
+}
+
+private data class AccessSnapshot(
+    val method: com.ivarna.mkm.shell.ShellManager.AccessMethod,
+    val shizukuInstalled: Boolean,
+    val shizukuRunning: Boolean,
+    val shizukuHidden: Boolean,
+    val shizukuGranted: Boolean,
+    val shizukuError: String?
+)
+
+/** Probes access off the main thread; re-probes on resume and on Shizuku binder received/dead. */
+@Composable
+private fun rememberAccessSnapshot(): AccessSnapshot? {
+    var refreshKey by remember { mutableStateOf(0) }
+    var snapshot by remember { mutableStateOf<AccessSnapshot?>(null) }
+    androidx.lifecycle.compose.LifecycleResumeEffect(Unit) {
+        refreshKey++
+        onPauseOrDispose { }
+    }
+    DisposableEffect(Unit) {
+        val received = Shizuku.OnBinderReceivedListener { refreshKey++ }
+        val dead = Shizuku.OnBinderDeadListener { refreshKey++ }
+        val result = Shizuku.OnRequestPermissionResultListener { _, _ -> refreshKey++ }
+        ShizukuManager.addBinderReceivedListener(received)
+        ShizukuManager.addBinderDeadListener(dead)
+        Shizuku.addRequestPermissionResultListener(result)
+        onDispose {
+            ShizukuManager.removeBinderReceivedListener(received)
+            ShizukuManager.removeBinderDeadListener(dead)
+            Shizuku.removeRequestPermissionResultListener(result)
+        }
+    }
+    LaunchedEffect(refreshKey) {
+        snapshot = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val granted = ShizukuManager.hasPermission()
+            val error = if (granted) {
+                val probe = com.ivarna.mkm.shell.ShellManager.probeShizuku()
+                if (probe.isSuccess) null
+                else probe.stderr.ifBlank { com.ivarna.mkm.shell.ShellManager.lastShizukuError ?: "exit ${probe.exitCode}" }
+            } else null
+            AccessSnapshot(
+                method = com.ivarna.mkm.shell.ShellManager.getAvailableMethod(),
+                shizukuInstalled = ShizukuManager.isInstalled(),
+                shizukuRunning = ShizukuManager.isRunning(),
+                shizukuHidden = ShizukuManager.isHidden(),
+                shizukuGranted = granted,
+                shizukuError = error
+            )
+        }
+    }
+    return snapshot
 }
 
 @Composable

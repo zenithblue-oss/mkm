@@ -7,6 +7,8 @@ import android.os.Build
 import com.ivarna.mkm.service.BatteryMonitorService
 import com.ivarna.mkm.service.BootApplyService
 import com.ivarna.mkm.service.BootSettingsManager
+import com.ivarna.mkm.service.GameBoostAutoBoost
+import com.ivarna.mkm.service.GameBoostService
 import com.ivarna.mkm.service.GameBoostSnapshotStore
 
 /**
@@ -19,8 +21,10 @@ class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
 
-        // Game Boost is deliberately never auto-enabled. Remove a previous-boot
-        // ownership snapshot so a reboot cannot replay stale tuning.
+        // A previous-boot Game Boost session is never resumed: remove its
+        // ownership snapshot so a reboot cannot replay stale tuning. Game Boost
+        // starts at boot only through the explicit opt-in "apply on boot"
+        // setting (BootApplyService) or per-app auto boost.
         val gameBoostStore = GameBoostSnapshotStore(context)
         gameBoostStore.load()?.let { snapshot ->
             if (!gameBoostStore.isSameBoot(snapshot)) gameBoostStore.clear()
@@ -42,6 +46,9 @@ class BootReceiver : BroadcastReceiver() {
                 context.startService(batteryIntent)
             }
         }
+
+        // --- Per-app auto boost watcher ---
+        if (GameBoostAutoBoost.isEnabled(context)) GameBoostService.start(context)
 
         // --- Boot settings (new) ---
         if (BootSettingsManager.hasAnyEnabled(context)) {

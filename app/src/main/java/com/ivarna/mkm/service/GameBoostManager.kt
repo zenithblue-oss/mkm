@@ -9,6 +9,7 @@ import com.ivarna.mkm.data.model.GameBoostComponent
 import com.ivarna.mkm.data.model.GameBoostSnapshot
 import com.ivarna.mkm.data.model.GameBoostState
 import com.ivarna.mkm.data.model.componentsNeedingRestore
+import com.ivarna.mkm.shell.ShellManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -44,13 +45,15 @@ private val RESTORE_ORDER = listOf(
 class GameBoostManager(
     context: Context,
     private val backend: GameBoostTuningBackend = ProductionGameBoostTuningBackend(context),
-    private val sessionStore: GameBoostSessionStore = GameBoostSnapshotStore(context.applicationContext)
+    private val sessionStore: GameBoostSessionStore = GameBoostSnapshotStore(context.applicationContext),
+    private val backendAvailable: () -> Boolean = { ShellManager.hasRoot() || ShellManager.hasShizuku() }
 ) {
     private val appContext = context.applicationContext
     private val store = sessionStore
     private val mutex = Mutex()
     private val reconciliationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val reconciliationStarted = AtomicBoolean(false)
+    private val autoRecoveryAttempted = AtomicBoolean(false)
 
     init {
         // SharedPreferences access is intentionally the only constructor work.
@@ -96,7 +99,11 @@ class GameBoostManager(
         val snapshot = runCatching { backend.captureSnapshot(capabilities) }.getOrElse {
             return failBeforeMutation("Could not capture the original tuning state: ${it.message}")
         }
-        val supported = APPLY_ORDER.filter { capabilities.components[it]?.supported == true }.toSet()
+        val supported = APPLY_ORDER.filter { capabilities.components[it]?.supported == true }
+            // Storage capture is best-effort; without a snapshot it can neither be applied nor restored.
+            .filterNot { snapshot.storage == null && it.isStorage() }
+            .toSet()
+        if (supported.isEmpty()) return failBeforeMutation("No safe Game Boost component is supported")
         var working = snapshot.copy(phase = "ENABLING", attempted = supported)
         if (!store.save(working)) return failBeforeMutation("Could not durably save the original tuning state")
 
@@ -104,8 +111,7 @@ class GameBoostManager(
         val warnings = mutableListOf<String>()
         val unsupported = APPLY_ORDER.filterNot { it in supported }.toSet()
         for (component in APPLY_ORDER) {
-            val capability = capabilities.components.getValue(component)
-            if (!capability.supported) continue
+            if (component !in supported) continue
 
             if (component.isMaxLock() && isSevereThermal()) {
                 working = working.copy(thermallyReleased = working.thermallyReleased + component)
@@ -179,7 +185,24 @@ class GameBoostManager(
         return GameBoostTransitionResult.Success()
     }
 
-    suspend fun retryRecovery(): GameBoostTransitionResult = disable()
+    /**
+     * Explicit user retry. If the kernel still refuses the saved values (e.g. it
+     * keeps a different CPU max and the restore returns Failed), release
+     * ownership anyway so the toggle and manual tuning are not locked forever;
+     * the reason is returned so the UI can show what was not restored.
+     */
+    suspend fun retryRecovery(): GameBoostTransitionResult {
+        val result = disable()
+        if (result !is GameBoostTransitionResult.Failure) return result
+        return mutex.withLock {
+            KernelTuningCoordinator.withMutation {
+                if (store.clear()) {
+                    GameBoostRegistry.publish(GameBoostState.Off)
+                    GameBoostTransitionResult.Failure("Released Game Boost; some values could not be restored: ${result.reason}")
+                } else result
+            }
+        }
+    }
 
     /** Called by the foreground service when the system reports severe thermal stress. */
     suspend fun onThermalStatus(status: Int): Unit = mutex.withLock {
@@ -188,65 +211,53 @@ class GameBoostManager(
 
     private fun onThermalStatusLocked(status: Int) {
         if (status < PowerManager.THERMAL_STATUS_SEVERE) return
+        thermalReleaseLocked("during thermal release")
+    }
+
+    /** Called by the service when no thermal signal (HAL or CPU zones) is available. */
+    suspend fun onThermalMonitoringUnavailable(): Unit = mutex.withLock {
+        KernelTuningCoordinator.withMutation { thermalReleaseLocked("while thermal monitoring was unavailable") }
+    }
+
+    /**
+     * Restores every boosted component (max locks AND governors: a `performance`
+     * governor alone still pins clocks high) while keeping session ownership.
+     */
+    private fun thermalReleaseLocked(context: String) {
         val snapshot = store.load() ?: return
-        val maxComponents = snapshot.componentsNeedingRestore()
-            .filter { it.isMaxLock() }
-            .toSet()
-        if (maxComponents.isEmpty()) return
-
-        for (component in RESTORE_ORDER.filter { it in maxComponents }) {
-            val result = when (component) {
-                GameBoostComponent.CPU_MAX_LOCK -> backend.restoreCpuRanges(snapshot)
-                GameBoostComponent.GPU_MAX_LOCK -> backend.restoreGpuRange(snapshot)
-                GameBoostComponent.STORAGE_MAX_LOCK -> backend.restoreStorageRange(snapshot)
-                else -> ApplyResult.Applied("not a max lock", "not a max lock")
-            }
-            if (result !is ApplyResult.Applied) {
-                enterRecovery(snapshot, snapshot.componentsNeedingRestore(), "${result.message()} during thermal release")
-                return
-            }
+        // A failed restore already parked the session in RECOVERY; retrying the
+        // same writes every poll would loop. The user retries from the UI.
+        if (snapshot.phase == "RECOVERY") return
+        val dirty = snapshot.componentsNeedingRestore()
+        if (dirty.isEmpty()) return
+        restore(dirty, snapshot)?.let { failed ->
+            enterRecovery(snapshot, dirty, "${failed.message()} $context")
+            return
         }
-
-        val released = snapshot.thermallyReleased + maxComponents
+        val released = snapshot.thermallyReleased + dirty
         val updated = snapshot.copy(phase = "THERMAL_LIMITED", thermallyReleased = released)
         if (!store.save(updated)) {
-            enterRecovery(snapshot, snapshot.componentsNeedingRestore(), "Could not persist thermal release state")
+            enterRecovery(snapshot, dirty, "Could not persist thermal release state")
             return
         }
         GameBoostRegistry.publish(GameBoostState.ThermalLimited(snapshot.applied - released, released))
     }
 
-    /** Called by the service when API 29+ thermal monitoring is unavailable. */
-    suspend fun onThermalMonitoringUnavailable(): Unit = mutex.withLock {
-        KernelTuningCoordinator.withMutation {
-            val snapshot = store.load() ?: return@withMutation
-            val maxComponents = snapshot.componentsNeedingRestore().filter { it.isMaxLock() }.toSet()
-            if (maxComponents.isEmpty()) return@withMutation
-            for (component in RESTORE_ORDER.filter { it in maxComponents }) {
-                val result = when (component) {
-                    GameBoostComponent.CPU_MAX_LOCK -> backend.restoreCpuRanges(snapshot)
-                    GameBoostComponent.GPU_MAX_LOCK -> backend.restoreGpuRange(snapshot)
-                    GameBoostComponent.STORAGE_MAX_LOCK -> backend.restoreStorageRange(snapshot)
-                    else -> ApplyResult.Applied("not a max lock", "not a max lock")
-                }
-                if (result !is ApplyResult.Applied) {
-                    enterRecovery(snapshot, snapshot.componentsNeedingRestore(), "${result.message()} while thermal monitoring was unavailable")
-                    return@withMutation
-                }
-            }
-            val released = snapshot.thermallyReleased + maxComponents
-            val updated = snapshot.copy(phase = "THERMAL_LIMITED", thermallyReleased = released)
-            if (!store.save(updated)) {
-                enterRecovery(snapshot, snapshot.componentsNeedingRestore(), "Could not persist fail-safe thermal release")
-                return@withMutation
-            }
-            GameBoostRegistry.publish(GameBoostState.ThermalLimited(snapshot.applied - released, released))
-        }
+    /** Re-run after a late backend (e.g. Shizuku binder) appears; the first pass may have lacked access. */
+    fun requestReconcile() {
+        reconciliationStarted.set(true)
+        reconciliationScope.launch { reconcile() }
     }
 
     /** Reconciles persisted ownership without doing provider I/O on the caller thread. */
-    suspend fun reconcile() = mutex.withLock {
-        KernelTuningCoordinator.withMutation { reconcileLocked() }
+    suspend fun reconcile() {
+        mutex.withLock { KernelTuningCoordinator.withMutation { reconcileLocked() } }
+        // One automatic restore attempt per process, and only once a backend
+        // can actually perform it (otherwise the attempt would be wasted).
+        if (currentState() is GameBoostState.RecoveryRequired && backendAvailable() &&
+            autoRecoveryAttempted.compareAndSet(false, true)) {
+            disable()
+        }
     }
 
     private fun reconcileLocked() {
@@ -351,10 +362,15 @@ class GameBoostManager(
     }
 
     private fun isSevereThermal(): Boolean {
+        // CPU zones are checked first: "disable throttling" stops the thermal HAL.
+        GameBoostThermalGuard.zoneThermalStatus()?.let { if (it >= GameBoostThermalGuard.STATUS_SEVERE) return true }
         if (Build.VERSION.SDK_INT < 29) return true
         val power = appContext.getSystemService(PowerManager::class.java) ?: return true
         return power.currentThermalStatus >= PowerManager.THERMAL_STATUS_SEVERE
     }
+
+    private fun GameBoostComponent.isStorage() =
+        this == GameBoostComponent.STORAGE_GOVERNOR || this == GameBoostComponent.STORAGE_MAX_LOCK
 
     private fun GameBoostComponent.isMaxLock() =
         this == GameBoostComponent.CPU_MAX_LOCK || this == GameBoostComponent.GPU_MAX_LOCK ||

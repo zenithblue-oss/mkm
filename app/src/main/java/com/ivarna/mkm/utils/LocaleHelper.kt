@@ -19,14 +19,17 @@ object LocaleHelper {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putString(KEY_LOCALE, localeCode)
-            .apply()
+            .commit()
     }
 
     fun resolveLocale(localeCode: String): Locale {
         return when (localeCode) {
             "EN" -> Locale.forLanguageTag("en")
             "ZH_CN" -> Locale.forLanguageTag("zh-CN")
-            else -> Locale.getDefault()
+            // Not Locale.getDefault(): wrap() overwrites it, so switching back to SYSTEM would stick.
+            else -> android.content.res.Resources.getSystem().configuration.let {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) it.locales[0] else @Suppress("DEPRECATION") it.locale
+            }
         }
     }
 

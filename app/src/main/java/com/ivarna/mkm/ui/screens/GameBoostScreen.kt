@@ -10,6 +10,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.ui.semantics.Role
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.AlertDialog
@@ -54,6 +60,11 @@ fun GameBoostScreen(viewModel: GameBoostViewModel = viewModel(), onOpenDrawer: (
     val message by viewModel.message.collectAsState()
     val bootEnabled by viewModel.bootEnabled.collectAsState()
     var showDisclosure by remember { mutableStateOf(false) }
+    var showAutoDisclosure by remember { mutableStateOf(false) }
+    var showPicker by remember { mutableStateOf(false) }
+    val autoEnabled by viewModel.autoEnabled.collectAsState()
+    val autoPackages by viewModel.autoPackages.collectAsState()
+    val apps by viewModel.apps.collectAsState()
     val owns = state !is GameBoostState.Off
     val transitioning = state is GameBoostState.Enabling || state is GameBoostState.Disabling
 
@@ -96,6 +107,17 @@ fun GameBoostScreen(viewModel: GameBoostViewModel = viewModel(), onOpenDrawer: (
                 )
             }
             item {
+                AutoBoostCard(
+                    enabled = autoEnabled,
+                    selectedCount = autoPackages.size,
+                    onToggle = { enabled ->
+                        if (enabled && !viewModel.disclosureAcknowledged) showAutoDisclosure = true
+                        else viewModel.setAutoEnabled(enabled)
+                    },
+                    onChoose = { viewModel.loadApps(); showPicker = true }
+                )
+            }
+            item {
                 GameBoostStatusCard(state, capabilities)
             }
             message?.let { msg -> item { Text(msg, color = MaterialTheme.colorScheme.error) } }
@@ -113,6 +135,70 @@ fun GameBoostScreen(viewModel: GameBoostViewModel = viewModel(), onOpenDrawer: (
             confirmButton = { TextButton(onClick = { showDisclosure = false; viewModel.acknowledgeDisclosure(); viewModel.toggle(true) }) { Text(stringResource(R.string.continue_text)) } },
             dismissButton = { TextButton(onClick = { showDisclosure = false }) { Text(stringResource(R.string.cancel)) } }
         )
+    }
+
+    if (showAutoDisclosure) {
+        AlertDialog(
+            onDismissRequest = { showAutoDisclosure = false },
+            title = { Text(stringResource(R.string.game_boost_disclosure_title)) },
+            text = { Text(stringResource(R.string.game_boost_disclosure)) },
+            confirmButton = { TextButton(onClick = { showAutoDisclosure = false; viewModel.acknowledgeDisclosure(); viewModel.setAutoEnabled(true) }) { Text(stringResource(R.string.continue_text)) } },
+            dismissButton = { TextButton(onClick = { showAutoDisclosure = false }) { Text(stringResource(R.string.cancel)) } }
+        )
+    }
+
+    if (showPicker) {
+        var selection by remember { mutableStateOf(autoPackages) }
+        AlertDialog(
+            onDismissRequest = { showPicker = false },
+            title = { Text(stringResource(R.string.game_boost_auto_pick_title)) },
+            text = {
+                val list = apps
+                if (list == null) {
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                } else {
+                    LazyColumn(Modifier.heightIn(max = 420.dp)) {
+                        items(list, key = { it.packageName }) { app ->
+                            val checked = app.packageName in selection
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .toggleable(value = checked, role = Role.Checkbox) {
+                                        selection = if (it) selection + app.packageName else selection - app.packageName
+                                    }
+                                    .padding(vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(checked = checked, onCheckedChange = null)
+                                Column(Modifier.padding(start = 12.dp)) {
+                                    Text(app.label)
+                                    Text(app.packageName, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { viewModel.setAutoPackages(selection); showPicker = false }) { Text(stringResource(R.string.game_boost_auto_done)) } },
+            dismissButton = { TextButton(onClick = { showPicker = false }) { Text(stringResource(R.string.cancel)) } }
+        )
+    }
+}
+
+@Composable
+private fun AutoBoostCard(enabled: Boolean, selectedCount: Int, onToggle: (Boolean) -> Unit, onChoose: () -> Unit) {
+    ElevatedCard {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            val title = stringResource(R.string.game_boost_auto_title)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                Switch(checked = enabled, onCheckedChange = onToggle, modifier = Modifier.semantics { contentDescription = title })
+            }
+            Text(stringResource(R.string.game_boost_auto_desc), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            OutlinedButton(onClick = onChoose, modifier = Modifier.fillMaxWidth()) {
+                Text(stringResource(R.string.game_boost_auto_choose, selectedCount))
+            }
+        }
     }
 }
 
@@ -160,7 +246,18 @@ internal fun GameBoostStatusCard(state: GameBoostState, capabilities: com.ivarna
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                         Text(stringResource(label)); Text(value, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    val detail = capability?.reason ?: capability?.target?.let { target ->
+                    val detail = capability?.reason ?: capability?.target?.let { raw ->
+                        // CPU: kHz list; GPU: unit-inferred raw; storage: devfreq Hz; governors pass through.
+                        val target = when (component) {
+                            GameBoostComponent.CPU_MAX_LOCK -> raw.split(",").joinToString(", ") { khz ->
+                                khz.trim().toLongOrNull()?.let(com.ivarna.mkm.utils.ShellUtils::formatFreq) ?: khz
+                            }
+                            GameBoostComponent.GPU_MAX_LOCK -> raw.toLongOrNull()?.let {
+                                com.ivarna.mkm.utils.ShellUtils.formatFreq(com.ivarna.mkm.data.provider.GpuProvider.rawFrequencyToKhz(it))
+                            } ?: raw
+                            GameBoostComponent.STORAGE_MAX_LOCK -> com.ivarna.mkm.utils.ShellUtils.formatHz(raw)
+                            else -> raw
+                        }
                         capability.source?.takeIf { it.isNotBlank() }?.let { source -> "Target $target ($source)" }
                             ?: "Target $target"
                     }

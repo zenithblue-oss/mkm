@@ -44,10 +44,47 @@ object BootSettingsManager {
     // Game Boost
     private const val PREF_GAME_BOOST_ENABLED = "boot_game_boost_enabled"
 
+    // Boot safe mode (bootloop guard)
+    private const val PREF_APPLY_IN_PROGRESS = "boot_apply_in_progress"
+    private const val PREF_APPLY_ATTEMPTS = "boot_apply_attempts"
+
+    const val PREFS_FILE = PREFS_NAME
+    private val ENABLE_KEYS = listOf(
+        PREF_CPU_ENABLED, PREF_GPU_ENABLED, PREF_RAM_ENABLED, PREF_STORAGE_ENABLED, PREF_GAME_BOOST_ENABLED
+    )
+
     // ---- helpers --------------------------------------------------------
 
     private fun prefs(context: Context): SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    // ---- Boot safe mode -------------------------------------------------
+
+    /** Marks an apply as started. Committed synchronously: a crash/reboot may follow. */
+    fun markApplyStarted(context: Context): Int {
+        val p = prefs(context)
+        val attempts = BootSafeMode.nextAttempts(p.getInt(PREF_APPLY_ATTEMPTS, 0))
+        p.edit().putBoolean(PREF_APPLY_IN_PROGRESS, true).putInt(PREF_APPLY_ATTEMPTS, attempts).commit()
+        return attempts
+    }
+
+    /** Called after the post-apply stability window: the device survived the apply. */
+    fun markApplyStable(context: Context) {
+        prefs(context).edit().putBoolean(PREF_APPLY_IN_PROGRESS, false).putInt(PREF_APPLY_ATTEMPTS, 0).commit()
+    }
+
+    fun isApplyInProgress(context: Context): Boolean = prefs(context).getBoolean(PREF_APPLY_IN_PROGRESS, false)
+
+    fun applyAttempts(context: Context): Int = prefs(context).getInt(PREF_APPLY_ATTEMPTS, 0)
+
+    /** Safe mode trip: turn every apply-on-boot category off and clear the guard. */
+    fun disableAllAndReset(context: Context) {
+        prefs(context).edit().apply {
+            ENABLE_KEYS.forEach { putBoolean(it, false) }
+            putBoolean(PREF_APPLY_IN_PROGRESS, false)
+            putInt(PREF_APPLY_ATTEMPTS, 0)
+        }.commit()
+    }
 
     fun hasAnyEnabled(context: Context): Boolean {
         val p = prefs(context)
@@ -195,4 +232,15 @@ object BootSettingsManager {
             )
         } else null
     }
+}
+
+/** Pure bootloop-guard rules (unit tested). */
+object BootSafeMode {
+    /** Stability window after apply completes before the in-progress flag is cleared. */
+    const val STABILITY_WINDOW_MS = 60_000L
+
+    fun nextAttempts(previous: Int): Int = (previous.coerceAtLeast(0) + 1).coerceAtMost(99)
+
+    /** A flag still set at boot means the last apply never reached its stability window. */
+    fun shouldTrip(applyInProgress: Boolean, attempts: Int): Boolean = applyInProgress && attempts > 0
 }
