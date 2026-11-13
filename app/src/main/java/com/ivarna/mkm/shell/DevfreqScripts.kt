@@ -3,83 +3,66 @@ package com.ivarna.mkm.shell
 object DevfreqScripts {
 
     /**
-     * Script to find the main RAM/Interconnect devfreq directory.
-     * Searches for common controller names like 'bimc', 'ddr', 'm4m', 'mtk-dvfsrc'.
+     * Finds the RAM/interconnect devfreq directory (bimc, ddr, m4m, dvfsrc, llcc).
+     * No "any devfreq node" fallback: a random GPU/UFS node must never be labelled DDR.
      */
     fun findDevfreqDir(): String {
-        return """
-            # Known specific paths
-            possible_names="mtk-dvfsrc-devfreq soc:qcom,bimc soc:qcom,ddr_bw soc:qcom,m4m soc:qcom,cpu-cpu-llcc-bw"
-            
-            for name in ${'$'}possible_names; do
-                if [ -e "/sys/class/devfreq/${'$'}name/governor" ]; then
-                    echo "/sys/class/devfreq/${'$'}name"
-                    exit 0
-                fi
+        return $$"""
+            (
+            for name in mtk-dvfsrc-devfreq soc:qcom,bimc soc:qcom,ddr_bw soc:qcom,m4m soc:qcom,cpu-cpu-llcc-bw; do
+                if [ -e "/sys/class/devfreq/$name/governor" ]; then echo "/sys/class/devfreq/$name"; exit 0; fi
             done
-            
-            # General search in /sys/class/devfreq/
-            # Look for controllers that look like memory controllers
             for path in /sys/class/devfreq/*; do
-                if [ -d "${'$'}path" ]; then
-                    name=${'$'}(basename "${'$'}path")
-                    if echo "${'$'}name" | grep -qE "bimc|ddr|m4m|dvfsrc|llcc"; then
-                         if [ -e "${'$'}path/governor" ]; then
-                            echo "${'$'}path"
-                            exit 0
-                        fi
-                    fi
-                fi
+                case "$(basename "$path")" in
+                    *bimc*|*ddr*|*m4m*|*dvfsrc*|*llcc*) [ -e "$path/governor" ] && { echo "$path"; exit 0; } ;;
+                esac
             done
-            
-            # If nothing found, just return the first one that has available_governors and frequencies,
-            # assuming it might be the main one or at least *a* tunable one.
-            # (Fallback)
-             for path in /sys/class/devfreq/*; do
-                if [ -e "${'$'}path/available_frequencies" ] && [ -e "${'$'}path/available_governors" ]; then
-                    echo "${'$'}path"
-                    exit 0
-                fi
-            done
-            
             echo "Not found"
             exit 1
+            )
         """.trimIndent()
     }
 
-    /**
-     * Script to get Devfreq info.
-     */
     fun getDevfreqInfo(path: String): String {
-        return """
-            echo "GOV=$(cat "$path/governor" 2>/dev/null)"
-            echo "AVAIL=$(cat "$path/available_governors" 2>/dev/null)"
-            echo "FREQ=$(cat "$path/cur_freq" 2>/dev/null || cat "$path/target_freq" 2>/dev/null)"
-            echo "AVAIL_FREQ=$(cat "$path/available_frequencies" 2>/dev/null)"
+        if (!SysfsTuningExecutor.isSafeSysfsPath(path)) return "false"
+        return $$"""
+            echo "GOV=$(cat "$$path/governor" 2>/dev/null)"
+            echo "AVAIL=$(cat "$$path/available_governors" 2>/dev/null)"
+            echo "FREQ=$(cat "$$path/cur_freq" 2>/dev/null || cat "$$path/target_freq" 2>/dev/null)"
+            echo "AVAIL_FREQ=$(cat "$$path/available_frequencies" 2>/dev/null)"
+            echo "MIN_FREQ=$(cat "$$path/min_freq" 2>/dev/null)"
+            echo "MAX_FREQ=$(cat "$$path/max_freq" 2>/dev/null)"
         """.trimIndent()
     }
 
+    private fun invalid(what: String) = "(echo 'Rejected unsafe $what' >&2; exit 1)"
+
+    /** Boot-time script form (BootApplyService). UI uses [com.ivarna.mkm.data.provider.DevfreqProvider]. */
     fun setGovernor(path: String, governor: String): String {
-        return "echo \"$governor\" > \"$path/governor\""
+        if (!SysfsTuningExecutor.isSafeSysfsPath(path) || !SysfsTuningExecutor.isSafeValue(governor)) return invalid("devfreq governor")
+        return "printf '%s' '$governor' > \"$path/governor\""
     }
 
     /**
-     * Sets frequency. Often requires userspace governor, but some kernels allow it directly.
-     * We will try to set userspace governor first in the UI/ViewModel if needed, 
-     * but this script just writes to the freq file.
-     * Note: 'userspace/set_freq' is the standard for the 'userspace' governor.
+     * Pins the frequency: userspace/ondemand set_freq if present, else min/max.
+     * Raising writes max first, lowering writes min first; writes are chained with && so failure is reported.
      */
     fun setFreq(path: String, freq: String): String {
-        return """
-            if [ -w "$path/userspace/set_freq" ]; then
-                echo "$freq" > "$path/userspace/set_freq"
-            elif [ -w "$path/ondemand/set_freq" ]; then
-                 echo "$freq" > "$path/ondemand/set_freq"
+        if (!SysfsTuningExecutor.isSafeSysfsPath(path) || freq.toLongOrNull()?.takeIf { it > 0 } == null) return invalid("devfreq frequency")
+        return $$"""
+            (
+            P="$$path"; F=$$freq
+            if [ -w "$P/userspace/set_freq" ]; then printf '%s' $F > "$P/userspace/set_freq"
+            elif [ -w "$P/ondemand/set_freq" ]; then printf '%s' $F > "$P/ondemand/set_freq"
             else
-                 # Try writing to min/max if direct set is not available, though this is less precise
-                 echo "$freq" > "$path/min_freq"
-                 echo "$freq" > "$path/max_freq"
+                MAX=$(cat "$P/max_freq" 2>/dev/null); case "$MAX" in ''|*[!0-9]*) MAX=0;; esac
+                if [ "$F" -ge "$MAX" ]; then
+                    printf '%s' $F > "$P/max_freq" && printf '%s' $F > "$P/min_freq"
+                else
+                    printf '%s' $F > "$P/min_freq" && printf '%s' $F > "$P/max_freq"
+                fi
             fi
+            )
         """.trimIndent()
     }
 }

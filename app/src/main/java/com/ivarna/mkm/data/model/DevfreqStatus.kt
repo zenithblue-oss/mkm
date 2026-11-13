@@ -7,5 +7,7 @@ data class DevfreqStatus(
     val availableGovernors: List<String> = emptyList(),
     val currentFreq: String = "0",
     val availableFrequencies: List<String> = emptyList(),
-    val debugInfo: String = ""
+    val debugInfo: String = "",
+    val minFreq: String = "",
+    val maxFreq: String = ""
 )

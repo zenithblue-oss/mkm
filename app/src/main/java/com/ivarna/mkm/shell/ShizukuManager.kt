@@ -17,7 +17,8 @@ object ShizukuManager {
     private var initialized = false
     
     @Volatile
-    private var appContext: Context? = null
+    var appContext: Context? = null
+        private set
     
     /**
      * Initialize Shizuku. Call this in Application.onCreate()
@@ -31,9 +32,35 @@ object ShizukuManager {
         // Enable multi-process support if needed (disabled for single-process app)
         ShizukuProvider.enableMultiProcessSupport(false)
         
+        // Remember a denial so app starts never re-prompt (GH #21); the
+        // permission screen's explicit Grant button still can.
+        Shizuku.addRequestPermissionResultListener { requestCode, grantResult ->
+            if (requestCode == SHIZUKU_REQUEST_CODE) {
+                prefs()?.edit()?.putBoolean(KEY_DENIED, grantResult != PackageManager.PERMISSION_GRANTED)?.apply()
+            }
+        }
+        // Prompt once per process when Shizuku connects and access is not granted yet.
+        Shizuku.addBinderReceivedListenerSticky {
+            try {
+                if (!autoPrompted && !hasPermission() && !Shizuku.isPreV11() &&
+                    !Shizuku.shouldShowRequestPermissionRationale() &&
+                    prefs()?.getBoolean(KEY_DENIED, false) != true
+                ) {
+                    autoPrompted = true
+                    Shizuku.requestPermission(SHIZUKU_REQUEST_CODE)
+                }
+            } catch (e: Exception) { }
+        }
+
         initialized = true
         return isAvailable()
     }
+
+    @Volatile
+    private var autoPrompted = false
+    private const val KEY_DENIED = "shizuku_permission_denied"
+
+    private fun prefs() = appContext?.getSharedPreferences("shizuku_prefs", Context.MODE_PRIVATE)
     
     /**
      * Check if Shizuku app is installed on the device

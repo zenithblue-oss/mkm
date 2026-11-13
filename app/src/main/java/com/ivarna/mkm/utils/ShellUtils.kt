@@ -18,13 +18,8 @@ object ShellUtils {
         }
     }
 
-    fun formatSize(kilobytes: Long): String {
-        val bytes = kilobytes * 1024
-        if (bytes < 1024) return "$bytes B"
-        val exp = (Math.log(bytes.toDouble()) / Math.log(1024.0)).toInt()
-        val pre = "KMGTPE"[exp - 1]
-        return String.format(Locale.US, "%.1f %sB", bytes / Math.pow(1024.0, exp.toDouble()), pre)
-    }
+    /** [kilobytes] are kernel KiB (/proc/meminfo); shown in SI units like Android Settings. */
+    fun formatSize(kilobytes: Long): String = FormatUtils.formatBytes(kilobytes * 1024)
 
     fun formatFreq(khz: Long): String {
         return if (khz >= 1000000) {
@@ -33,6 +28,10 @@ object ShellUtils {
             "${khz / 1000} MHz"
         }
     }
+
+    /** devfreq Hz string ("273000000") -> "273 MHz"; non-numeric text passes through. */
+    fun formatHz(raw: String): String =
+        raw.trim().toLongOrNull()?.takeIf { it > 0 }?.let { formatFreq(it / 1000) } ?: raw
 
     fun writeFile(path: String, content: String): Boolean {
         return try {

@@ -10,36 +10,31 @@ object ThermalScripts {
         return "grep -H . /sys/class/thermal/thermal_zone*/type /sys/class/thermal/thermal_zone*/temp 2>/dev/null"
     }
 
-    /**
-     * Stop thermal engine services (Qualcomm).
-     */
-    fun stopThermalEngine(): String {
-        return "stop thermal-engine; " +
-               "stop thermald; " +
-               "stop mi_thermald; " +
-               "stop thermal_manager; " +
-               "stop vendor.thermal-engine; " +
-               "stop android.hardware.thermal-service; " +
-               "stop android.hardware.thermal-service.pixel; " +
-               "stop vendor.thermal-hal-2-0; " +
-               "stop vendor.thermal-hal-1-0; " +
-               "stop thermal-hal; " +
-               "stop thermalloadalgod; " +
-               "stop thermalservice; " +
-               "stop logd; " + // Maybe risky to stop logd, skipping it to be safe
-               "echo disable > /sys/class/thermal/thermal_zone*/mode; " +
-               "echo 0 > /sys/module/msm_thermal/parameters/enabled; " +
-               "echo 0 > /sys/kernel/msm_thermal/enabled; " +
-               "setprop init.svc.mi-thermald stopped; " +
-               "setprop init.svc.thermal-engine stopped; " +
-               "setprop init.svc.thermalservice stopped; " + 
-               "setprop init.svc.android.hardware.thermal-service stopped; " +
-               "true"
-    }
+    /** Known thermal daemons/HALs across vendors (Qualcomm, Xiaomi, MTK, Pixel, AOSP). */
+    val THERMAL_SERVICES = listOf(
+        "thermal-engine", "thermald", "mi_thermald", "thermal_manager", "vendor.thermal-engine",
+        "android.hardware.thermal-service", "android.hardware.thermal-service.pixel",
+        "vendor.thermal-hal-2-0", "vendor.thermal-hal-1-0", "thermal-hal", "thermalloadalgod", "thermalservice"
+    )
 
-    fun restartThermalEngine(): String {
-        return "start thermal-engine; start thermald; start mi_thermald; start thermal_manager; start android.hardware.thermal-service; start vendor.thermal-hal-2-0"
-    }
+    /**
+     * Stops every thermal service that exists and reports the real outcome per service.
+     * Output lines: `svc:<name>:<init.svc state after stop>`, `zones:<disabled>/<total>`, `msm:<ok|fail>`.
+     */
+    fun stopThermalEngine(): String =
+        "for s in ${THERMAL_SERVICES.joinToString(" ")}; do " +
+            "st=\$(getprop init.svc.\$s); [ -z \"\$st\" ] && continue; " +
+            "stop \$s 2>/dev/null; sleep 0.1; echo \"svc:\$s:\$(getprop init.svc.\$s)\"; done; " +
+            "ok=0; n=0; for f in /sys/class/thermal/thermal_zone*/mode; do [ -e \"\$f\" ] || continue; n=\$((n+1)); " +
+            "echo disabled > \"\$f\" 2>/dev/null && ok=\$((ok+1)); done; echo \"zones:\$ok/\$n\"; " +
+            "for p in /sys/module/msm_thermal/parameters/enabled /sys/kernel/msm_thermal/enabled; do " +
+            "[ -e \"\$p\" ] || continue; if echo 0 > \"\$p\" 2>/dev/null; then echo msm:ok; else echo msm:fail; fi; done; true"
+
+    /** Restarts stopped thermal services and re-enables zone modes. */
+    fun restartThermalEngine(): String =
+        "for s in ${THERMAL_SERVICES.joinToString(" ")}; do " +
+            "[ \"\$(getprop init.svc.\$s)\" = stopped ] && start \$s; done; " +
+            "for f in /sys/class/thermal/thermal_zone*/mode; do [ -e \"\$f\" ] && echo enabled > \"\$f\" 2>/dev/null; done; true"
 
     /**
      * Read thermal configuration file.
@@ -50,59 +45,32 @@ object ThermalScripts {
     }
 
     /**
-     * Set a new thermal limit by replacing set_point and set_point_clr in the config file.
-     * usage: replace set_point X with set_point Y
-     * This is a complex sed operation.
-     * We will replace ALL set_point values that look like they are high temps (e.g. > 60000).
-     * @param limitTemp Limit in degrees Celsius (e.g. 85)
+     * Rewrites set_point/set_point_clr only inside CPU sections of thermal-engine.conf
+     * (sections whose `sensor` is a CPU sensor). Backs up the original once.
+     * @param limitTemp Limit in degrees Celsius (validated 40..110)
      */
     fun setThermalLimit(limitTemp: Int): String {
+        require(limitTemp in 40..110) { "Thermal limit out of range" }
         val limitMilli = limitTemp * 1000
         val clearMilli = (limitTemp - 5) * 1000 // Clear throttle 5 degrees below limit
-        
-        // Find existing config file
-        val findFile = "FILE=\$(ls /vendor/etc/thermal-engine.conf 2>/dev/null || ls /system/etc/thermal-engine.conf 2>/dev/null | head -n 1)"
-        
-        // Backup
-        val backup = "cp \$FILE \$FILE.bak"
-        
-        // Replace set_point using sed. 
-        // We match `set_point <number>` and replace with `set_point <new_number>`
-        // But we only want to replace high values, not low ones (like battery thresholds).
-        // Let's assume we replace anything > 60000 (60C).
-        // It's safer to just replace specific known sections but generic replacement is requested.
-        // Regex: set_point [6-9][0-9][0-9][0-9][0-9] | 1[0-9][0-9][0-9][0-9][0-9]
-        
-        // sed -i 's/set_point [0-9]\{5,\}/set_point 95000/g' $FILE
-        // But we should be careful.
-        
-        val sedCmd = "sed -i -E 's/set_point [0-9]{5,}/set_point $limitMilli/g; s/set_point_clr [0-9]{5,}/set_point_clr $clearMilli/g' \$FILE"
-        
-        return "$findFile && $backup && $sedCmd"
+
+        val findFile = "FILE=\$(ls /vendor/etc/thermal-engine.conf 2>/dev/null || ls /system/etc/thermal-engine.conf 2>/dev/null | head -n 1); [ -n \"\$FILE\" ]"
+        val backup = "{ [ -f \"\$FILE.bak\" ] || cp \"\$FILE\" \"\$FILE.bak\"; }"
+        // Track the current section; only edit set_point lines once its sensor is a CPU sensor.
+        val awk = "awk '/^\\[/{cpu=0} /^[ \\t]*sensor[ \\t]/{s=tolower(\$2); cpu=(s ~ /cpu|big|mid|little|cpuss|mtktscpu|soc_therm/ && s !~ /battery|skin|charger|bcl|ibat|vbat|ocp|soc\$|socd|lvl|modem/)} " +
+            "cpu && \$1==\"set_point\" && \$2+0>=10000 {sub(/[0-9]+/, \"$limitMilli\")} " +
+            "cpu && \$1==\"set_point_clr\" && \$2+0>=10000 {sub(/[0-9]+/, \"$clearMilli\")} {print}' \"\$FILE\" > \"\$FILE.mkm\" && cat \"\$FILE.mkm\" > \"\$FILE\"; rm -f \"\$FILE.mkm\""
+        return "$findFile && $backup && $awk"
     }
 
     /**
-     * Get all trip points.
-     * Output format: zone_path:trip_type:trip_temp
+     * Zone types plus all trip points.
+     * Output format: path:value (grep -H)
      */
-    fun getTripPoints(): String {
-        // Use grep to read all trip point files at once.
-        return "grep -H . /sys/class/thermal/thermal_zone*/trip_point_*_type /sys/class/thermal/thermal_zone*/trip_point_*_temp 2>/dev/null"
-    }
+    fun getTripPoints(): String =
+        "grep -H . /sys/class/thermal/thermal_zone*/type /sys/class/thermal/thermal_zone*/trip_point_*_type /sys/class/thermal/thermal_zone*/trip_point_*_temp 2>/dev/null"
 
-    /**
-     * Set temperature for a specific trip point.
-     * Note: This might not persist after reboot or might be overwritten by kernel.
-     */
-    fun setTripPointTemp(zonePath: String, tripType: String, tempMilli: Int): String {
-        // We need to find the specific trip point file for this zone and type
-        // This is a bit complex as we don't know the ID (trip_point_0, trip_point_1, etc) from just the type
-        // So we iterate to find it.
-        
-        return "for trip in $zonePath/trip_point_*_type; do " +
-                "if [ \"\$(cat \"\$trip\")\" = \"$tripType\" ]; then " +
-                "echo \"$tempMilli\" > \"\${trip%_type}_temp\"; " +
-                "fi; " +
-                "done"
-    }
+    /** Cooling devices: path:value lines for type/cur_state/max_state. */
+    fun getCoolingDevices(): String =
+        "grep -H . /sys/class/thermal/cooling_device*/type /sys/class/thermal/cooling_device*/cur_state /sys/class/thermal/cooling_device*/max_state 2>/dev/null"
 }

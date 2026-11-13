@@ -18,6 +18,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.ivarna.mkm.data.provider.ThermalDisableReport
 import com.ivarna.mkm.data.provider.ThermalStatus
 import com.ivarna.mkm.data.provider.ThermalZone
 
@@ -32,7 +33,10 @@ fun ThermalCard(
     isLoading: Boolean = false,
     onSetLimit: (Int) -> Unit,
     onDisableThrottling: () -> Unit,
-    controlsEnabled: Boolean = true
+    controlsEnabled: Boolean = true,
+    onRestoreThermal: () -> Unit = {},
+    report: ThermalDisableReport? = null,
+    restored: Boolean? = null
 ) {
     var expanded by remember { mutableStateOf(false) }
     var showWarningDialog by remember { mutableStateOf(false) }
@@ -74,7 +78,7 @@ fun ThermalCard(
                         } else {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(
-                                    text = "Peak: ${status.maxTemp}°C",
+                                    text = "Peak: ${"%.1f".format(status.maxTemp)}°C",
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = if (status.maxTemp > 80) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -128,7 +132,7 @@ fun ThermalCard(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             Text(
-                                text = "${zone.temp}°C",
+                                text = "${"%.1f".format(zone.temp)}°C",
                                 style = MaterialTheme.typography.bodySmall,
                                 fontWeight = FontWeight.Bold,
                                 color = if (zone.temp > 80) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface 
@@ -168,6 +172,37 @@ fun ThermalCard(
                         }
                     }
                     
+                    OutlinedButton(
+                        onClick = onRestoreThermal,
+                        enabled = controlsEnabled,
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                    ) {
+                        Text(stringResource(com.ivarna.mkm.R.string.restore_thermal))
+                    }
+
+                    val outcome = when {
+                        report != null && report.anyEffect -> stringResource(
+                            com.ivarna.mkm.R.string.thermal_disable_report_format,
+                            report.stopped.joinToString().ifEmpty { "-" },
+                            report.running.joinToString().ifEmpty { "-" },
+                            report.zonesDisabled,
+                            report.zonesTotal
+                        )
+                        report != null -> stringResource(com.ivarna.mkm.R.string.thermal_disable_no_effect)
+                        restored == true -> stringResource(com.ivarna.mkm.R.string.thermal_restored)
+                        restored == false -> stringResource(com.ivarna.mkm.R.string.thermal_restore_failed)
+                        else -> null
+                    }
+                    if (outcome != null) {
+                        Text(
+                            text = outcome,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (report?.anyEffect == false || restored == false) MaterialTheme.colorScheme.error
+                                else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 8.dp)
+                        )
+                    }
+
                     TextButton(
                         onClick = { showLogDialog = true },
                         modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
@@ -180,8 +215,8 @@ fun ThermalCard(
     }
 
     if (showLimitDialog) {
-        var sliderValue by remember { mutableFloatStateOf(status.currentLimit.toFloat().coerceIn(45f, 95f)) }
-        if (sliderValue == 0f) sliderValue = 85f // Default if reading failed
+        // Unknown limit (0) defaults to 85 °C, not the slider minimum.
+        var sliderValue by remember { mutableFloatStateOf(status.currentLimit.takeIf { it > 0 }?.toFloat()?.coerceIn(45f, 95f) ?: 85f) }
 
         AlertDialog(
             onDismissRequest = { showLimitDialog = false },

@@ -168,8 +168,16 @@ for freq in ${"$"}sorted_freqs; do
     
     power_W=${"$"}(echo ${"$"}vals)
     
-    util=${"$"}(cat "${"$"}GPU_PATH/gpu_busy" 2>/dev/null || cat "${"$"}GPU_PATH/load" 2>/dev/null || echo "0")
-    
+    # kgsl gpubusy is "busy total" (cycles) -> busy*100/total. Others: first integer of the node.
+    KGSL=/sys/class/kgsl/kgsl-3d0
+    if [ -r "${"$"}KGSL/gpubusy" ]; then
+        util=${"$"}(awk '{ if (${"$"}2 > 0) printf "%d", ${"$"}1 * 100 / ${"$"}2; else print 0 }' "${"$"}KGSL/gpubusy" 2>/dev/null)
+    else
+        raw=${"$"}(cat "${"$"}KGSL/gpu_busy_percentage" 2>/dev/null || cat "${"$"}GPU_PATH/gpu_busy" 2>/dev/null || cat "${"$"}GPU_PATH/load" 2>/dev/null || cat /sys/kernel/gpu/gpu_busy 2>/dev/null)
+        util=${"$"}(echo "${"$"}raw" | awk '{ if (match(${"$"}0, /[0-9]+/)) print substr(${"$"}0, RSTART, RLENGTH); else print 0 }')
+    fi
+    [ -z "${"$"}util" ] && util=0
+
     echo "${"$"}cur_freq,1.0,${"$"}util,${"$"}power_W,0" >> ${"$"}OUTPUT_FILE
 done
 

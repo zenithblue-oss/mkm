@@ -13,6 +13,11 @@ object ShellManager {
     private const val COMMAND_TIMEOUT_MS = 10_000L
     private const val STREAM_JOIN_TIMEOUT_MS = 1_000L
 
+    /** Last Shizuku transport failure, surfaced on the permission screen for bug reports. */
+    @Volatile
+    var lastShizukuError: String? = null
+        private set
+
 
     /**
      * Access method enum for identifying the current execution mode
@@ -70,35 +75,64 @@ object ShellManager {
         return Shell.getShell().isRoot
     }
 
+    /** Shizuku server started as uid 0 (e.g. `adb root` + rooted debugging): behaves as root without su. */
+    fun hasShizukuRoot(): Boolean = hasShizuku() && ShizukuManager.isRootMode()
+
+    fun appString(id: Int): String = ShizukuManager.appContext?.getString(id) ?: ""
+
+    /** Single source of truth for "can perform root-only operations" (libsu root OR Shizuku running as uid 0). */
+    fun hasRootCapability(): Boolean = hasRoot() || hasShizukuRoot()
+
     /** Execute a command according to its privilege requirement. */
-    fun exec(command: String, requirement: PrivilegeRequirement = PrivilegeRequirement.NORMAL): CommandResult {
+    fun exec(
+        command: String,
+        requirement: PrivilegeRequirement = PrivilegeRequirement.NORMAL,
+        timeoutMs: Long = COMMAND_TIMEOUT_MS
+    ): CommandResult {
         val order = PrivilegeExecutionPolicy.order(requirement, hasRoot(), hasShizuku())
         if (order.isEmpty()) return CommandResult(-1, "", "No elevated backend available")
 
         var lastResult: CommandResult? = null
         for (backend in order) {
             val result = when (backend) {
-                ExecutionBackend.ROOT -> execRoot(command)
-                ExecutionBackend.SHIZUKU -> execShizuku(command)
-                ExecutionBackend.LOCAL -> execLocal(command)
+                ExecutionBackend.ROOT -> execRoot(command, timeoutMs)
+                ExecutionBackend.SHIZUKU -> execShizuku(command, timeoutMs)
+                ExecutionBackend.LOCAL -> execLocal(command, timeoutMs)
             }
             lastResult = result
             // Normal commands preserve the existing behavior: a real shell
             // failure is returned, while an unavailable backend may fall back.
+            // A timed-out command may still be running, so it is never re-run.
             // Elevated operations use a root-first order and never include
             // LOCAL, so permission failures cannot become fake sysfs writes.
-            if (result.isSuccess || result.exitCode != -1 || requirement == PrivilegeRequirement.ELEVATED_SYSFS) {
+            if (result.isSuccess || result.exitCode != -1 || result.timedOut ||
+                requirement == PrivilegeRequirement.ELEVATED_SYSFS) {
                 return result
             }
         }
         return lastResult ?: CommandResult(-1, "", "No execution backend available")
     }
 
+    /** Runs a trivial command on Shizuku only, to surface transport errors when permission is granted. */
+    fun probeShizuku(): CommandResult = execShizuku("id -u", 3_000L)
+
+    /** Root-first, never-local execution for kernel nodes (see [PrivilegeExecutionPolicy]). */
+    fun execElevated(command: String, timeoutMs: Long = COMMAND_TIMEOUT_MS): CommandResult =
+        exec(command, PrivilegeRequirement.ELEVATED_SYSFS, timeoutMs)
+
     /**
-     * Execute via root (libsu)
+     * Execute via root (libsu). libsu has no per-command timeout, so the job
+     * is enqueued and awaited with a deadline.
+     * ponytail: a hung command still occupies libsu's single root shell until it exits.
      */
-    private fun execRoot(command: String): CommandResult {
-        val result = Shell.cmd(command).exec()
+    private fun execRoot(command: String, timeoutMs: Long = COMMAND_TIMEOUT_MS): CommandResult {
+        val result = try {
+            Shell.cmd(command).enqueue().get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (_: java.util.concurrent.TimeoutException) {
+            return CommandResult(-1, "", "Command timeout after ${timeoutMs / 1000} seconds", ExecutionBackend.ROOT, timedOut = true)
+        } catch (e: Exception) {
+            return CommandResult(-1, "", "Root execution failed: ${e.message}", ExecutionBackend.ROOT)
+        }
         return CommandResult(
             result.code,
             result.out.joinToString("\n").trim(),
@@ -110,7 +144,7 @@ object ShellManager {
     /**
      * Execute via Shizuku (ADB shell with uid=2000)
      */
-    private fun execShizuku(command: String): CommandResult {
+    private fun execShizuku(command: String, timeoutMs: Long = COMMAND_TIMEOUT_MS): CommandResult {
         return try {
             // Use reflection to access private Shizuku.newProcess()
             val method = rikka.shizuku.Shizuku::class.java.getDeclaredMethod(
@@ -128,89 +162,53 @@ object ShellManager {
                 null   // working directory
             ) as Process
             
-            // Close stdin immediately to prevent process from waiting for input
-            process.outputStream.close()
-            
-            val output = StringBuilder()
-            val error = StringBuilder()
-            
-            // Read streams in parallel threads to avoid deadlock
-            val outThread = Thread {
-                try {
-                    BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
-                        reader.lineSequence().forEach { line ->
-                            output.append(line).append("\n")
-                        }
-                    }
-                } catch (e: Exception) {
-                    // Stream closed, normal for process completion
-                }
+            collectProcess(process, timeoutMs, ExecutionBackend.SHIZUKU).also {
+                if (it.timedOut) lastShizukuError = it.stderr
             }
-            
-            val errThread = Thread {
-                try {
-                    BufferedReader(InputStreamReader(process.errorStream)).use { reader ->
-                        reader.lineSequence().forEach { line ->
-                            error.append(line).append("\n")
-                        }
-                    }
-                } catch (e: Exception) {
-                    // Stream closed, normal for process completion
-                }
-            }
-            
-            outThread.start()
-            errThread.start()
-            
-            // Wait for process with timeout
-            val finished = waitForProcess(process, COMMAND_TIMEOUT_MS)
-            
-            // Wait for threads to finish reading
-            outThread.join(STREAM_JOIN_TIMEOUT_MS)
-            errThread.join(STREAM_JOIN_TIMEOUT_MS)
-            
-            if (!finished) {
-                process.destroy()
-                return CommandResult(-1, output.toString().trim(), "Command timeout after 10 seconds", ExecutionBackend.SHIZUKU)
-            }
-            
-            val exitCode = process.exitValue()
-            CommandResult(exitCode, output.toString().trim(), error.toString().trim(), ExecutionBackend.SHIZUKU)
         } catch (e: Exception) {
-            CommandResult(-1, "", "Shizuku execution failed: ${e.message}", ExecutionBackend.SHIZUKU)
+            val cause = (e as? java.lang.reflect.InvocationTargetException)?.targetException ?: e
+            CommandResult(-1, "", "Shizuku execution failed: ${cause.javaClass.simpleName}: ${cause.message}", ExecutionBackend.SHIZUKU)
+                .also { lastShizukuError = it.stderr }
         }
     }
 
     /**
      * Execute via local shell (non-root)
      */
-    private fun execLocal(command: String): CommandResult {
+    private fun execLocal(command: String, timeoutMs: Long = COMMAND_TIMEOUT_MS): CommandResult {
         return try {
-            val process = Runtime.getRuntime().exec(arrayOf("sh", "-c", command))
-            val output = StringBuilder()
-            val error = StringBuilder()
-            
-            val outReader = BufferedReader(InputStreamReader(process.inputStream))
-            val errReader = BufferedReader(InputStreamReader(process.errorStream))
-            
-            var line: String?
-            while (outReader.readLine().also { line = it } != null) {
-                output.append(line).append("\n")
-            }
-            
-            while (errReader.readLine().also { line = it } != null) {
-                error.append(line).append("\n")
-            }
-            
-            val finished = waitForProcess(process, COMMAND_TIMEOUT_MS)
-            if (!finished) {
-                process.destroy()
-                return CommandResult(-1, output.toString().trim(), "Command timeout after 10 seconds", ExecutionBackend.LOCAL)
-            }
-            CommandResult(process.exitValue(), output.toString().trim(), error.toString().trim(), ExecutionBackend.LOCAL)
+            collectProcess(Runtime.getRuntime().exec(arrayOf("sh", "-c", command)), timeoutMs, ExecutionBackend.LOCAL)
         } catch (e: Exception) {
             CommandResult(-1, "", e.message ?: "Unknown local error", ExecutionBackend.LOCAL)
         }
+    }
+
+    /** Drains stdout and stderr concurrently so the deadline holds even when a stream blocks. */
+    private fun collectProcess(process: Process, timeoutMs: Long, backend: ExecutionBackend): CommandResult {
+        // Close stdin immediately to prevent process from waiting for input
+        runCatching { process.outputStream.close() }
+        val output = StringBuffer()
+        val error = StringBuffer()
+        fun drain(stream: java.io.InputStream, sink: StringBuffer) = Thread {
+            try {
+                BufferedReader(InputStreamReader(stream)).use { reader ->
+                    reader.lineSequence().forEach { line -> sink.append(line).append("\n") }
+                }
+            } catch (_: Exception) {
+                // Stream closed, normal for process completion
+            }
+        }.apply { isDaemon = true; start() }
+        val outThread = drain(process.inputStream, output)
+        val errThread = drain(process.errorStream, error)
+
+        val finished = waitForProcess(process, timeoutMs)
+        if (!finished) process.destroy()
+        outThread.join(STREAM_JOIN_TIMEOUT_MS)
+        errThread.join(STREAM_JOIN_TIMEOUT_MS)
+        if (!finished) {
+            return CommandResult(-1, output.toString().trim(), "Command timeout after ${timeoutMs / 1000} seconds", backend, timedOut = true)
+        }
+        return CommandResult(process.exitValue(), output.toString().trim(), error.toString().trim(), backend)
     }
 
     private fun waitForProcess(process: Process, timeoutMillis: Long): Boolean {
@@ -233,7 +231,8 @@ object ShellManager {
         val exitCode: Int,
         val stdout: String,
         val stderr: String,
-        val backend: ExecutionBackend? = null
+        val backend: ExecutionBackend? = null,
+        val timedOut: Boolean = false
     ) {
         val isSuccess: Boolean get() = exitCode == 0
     }

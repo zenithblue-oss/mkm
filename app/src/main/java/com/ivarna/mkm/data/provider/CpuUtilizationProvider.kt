@@ -48,7 +48,20 @@ object CpuUtilizationProvider {
     private var cachedPerCoreUsage: Map<Int, Float> = emptyMap()
     private var lastCalculationTime: Long = 0
     private const val MIN_UPDATE_INTERVAL = 900L // 900ms minimum between new measurements
-    
+
+    /** True when /proc/stat was unreadable and the values are a frequency-based estimate. */
+    @Volatile
+    var isEstimate: Boolean = false
+        private set
+
+    /** Busy fraction between two /proc/stat samples; null when the delta is unusable. */
+    internal fun deltaUsage(prevTotal: Long, prevIdle: Long, total: Long, idle: Long): Float? {
+        val totalDelta = total - prevTotal
+        val idleDelta = idle - prevIdle
+        if (totalDelta <= 0 || idleDelta < 0 || idleDelta > totalDelta) return null
+        return (1f - idleDelta.toFloat() / totalDelta.toFloat()).coerceIn(0f, 1f)
+    }
+
     /**
      * Get overall CPU usage percentage (0.0 to 1.0).
      * Uses /proc/stat if available via root, otherwise falls back to frequency-based calculation.
@@ -83,8 +96,15 @@ object CpuUtilizationProvider {
         }
         
         // Try /proc/stat method for both per-core and overall at once (more efficient)
-        val procStatSuccess = updateFromProcStat()
-        
+        val firstSample = lastOverallStat == null
+        var procStatSuccess = updateFromProcStat()
+        if (procStatSuccess && firstSample) {
+            // A single /proc/stat read has no delta; take a second one so the first paint is real.
+            Thread.sleep(200L)
+            procStatSuccess = updateFromProcStat()
+        }
+        isEstimate = !procStatSuccess
+
         if (!procStatSuccess && useFrequencyFallback) {
             // Fallback to frequency-based calculation
             cachedOverallUsage = getFrequencyBasedCpuUsage()
@@ -110,6 +130,7 @@ object CpuUtilizationProvider {
             val newPerCoreStats = mutableMapOf<Int, CpuStat>()
             val newPerCoreUsage = mutableMapOf<Int, Float>()
             var newOverallUsage = -1f
+            var sawOverall = false
             
             lines.forEach { line ->
                 val parts = line.trim().split(Regex("\\s+"))
@@ -120,43 +141,28 @@ object CpuUtilizationProvider {
                     val stat = parseCpuStatLine(line) ?: return@forEach
                     val prevStat = lastOverallStat
                     lastOverallStat = stat
-                    
+                    sawOverall = true
                     if (prevStat != null) {
-                        val totalDelta = stat.totalTime - prevStat.totalTime
-                        val idleDelta = stat.idleTime - prevStat.idleTime
-                        if (totalDelta > 0) {
-                            newOverallUsage = (1f - (idleDelta.toFloat() / totalDelta.toFloat())).coerceIn(0f, 1f)
-                        }
-                    } else {
-                        newOverallUsage = 0f
+                        deltaUsage(prevStat.totalTime, prevStat.idleTime, stat.totalTime, stat.idleTime)
+                            ?.let { newOverallUsage = it }
                     }
                 } else if (parts[0].startsWith("cpu")) {
                     // Per-core CPU stat
                     val coreId = parts[0].substring(3).toIntOrNull() ?: return@forEach
                     val stat = parseCpuStatLine(line) ?: return@forEach
                     newPerCoreStats[coreId] = stat
-                    
-                    val prevStat = lastPerCoreStat[coreId]
-                    if (prevStat != null) {
-                        val totalDelta = stat.totalTime - prevStat.totalTime
-                        val idleDelta = stat.idleTime - prevStat.idleTime
-                        if (totalDelta > 0) {
-                            newPerCoreUsage[coreId] = (1f - (idleDelta.toFloat() / totalDelta.toFloat())).coerceIn(0f, 1f)
-                        }
-                    } else {
-                        newPerCoreUsage[coreId] = 0f
-                    }
+                    val prevStat = lastPerCoreStat[coreId] ?: return@forEach
+                    deltaUsage(prevStat.totalTime, prevStat.idleTime, stat.totalTime, stat.idleTime)
+                        ?.let { newPerCoreUsage[coreId] = it }
                 }
             }
-            
-            if (newOverallUsage < 0 && newPerCoreUsage.isEmpty()) return false
-            
+
+            if (!sawOverall && newPerCoreStats.isEmpty()) return false
+            if (newPerCoreStats.isNotEmpty()) lastPerCoreStat = newPerCoreStats
+            // First sample (no delta yet) or a bogus delta: keep the previous values.
             if (newOverallUsage >= 0) cachedOverallUsage = newOverallUsage
-            if (newPerCoreUsage.isNotEmpty()) {
-                cachedPerCoreUsage = newPerCoreUsage
-                lastPerCoreStat = newPerCoreStats
-            }
-            
+            if (newPerCoreUsage.isNotEmpty()) cachedPerCoreUsage = newPerCoreUsage
+
             return true
         } catch (e: Exception) {
             Log.e(TAG, "Error updating from /proc/stat", e)

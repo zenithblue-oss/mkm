@@ -15,6 +15,7 @@ object GpuScripts {
                     "${'$'}root/time_in_state" \
                     "${'$'}root/freq_table_mhz" \
                     "${'$'}root/gpu_available_frequencies" \
+                    "${'$'}root/gpu_freq_table" \
                     "${'$'}root/frequency_table" \
                     "${'$'}root/operating-points" \
                     "${'$'}root/opp-hz" \
@@ -98,6 +99,27 @@ object GpuScripts {
                 exit 0
             fi
 
+            # 4. Google Tensor: platform Mali node, or a devfreq device under it
+            for d in /sys/devices/platform/*.mali; do
+                [ -d "${'$'}d" ] || continue
+                for df in "${'$'}d"/devfreq/*; do
+                    if [ -d "${'$'}df" ] && { [ -e "${'$'}df/governor" ] || [ -e "${'$'}df/cur_freq" ]; }; then
+                        echo "${'$'}df"
+                        exit 0
+                    fi
+                done
+                if [ -e "${'$'}d/cur_freq" ]; then
+                    echo "${'$'}d"
+                    exit 0
+                fi
+            done
+
+            # 5. Samsung Exynos: vendor GPU node without devfreq
+            if [ -e "/sys/kernel/gpu/gpu_clock" ]; then
+                echo "/sys/kernel/gpu"
+                exit 0
+            fi
+
             echo "Not found"
             exit 1
         """.trimIndent()
@@ -118,8 +140,8 @@ object GpuScripts {
      */
     fun getGpuInfo(path: String): String {
         return """
-            echo "GOV=$(cat "$path/governor" 2>/dev/null)"
-            echo "AVAIL=$(cat "$path/available_governors" 2>/dev/null)"
+            echo "GOV=$(cat "$path/governor" 2>/dev/null || cat "$path/gpu_governor" 2>/dev/null)"
+            echo "AVAIL=$(cat "$path/available_governors" 2>/dev/null || cat "$path/gpu_available_governor" 2>/dev/null)"
 
             # Frequencies - try primary path, then several fallbacks
             # (Adreno kernels may expose freq via kgsl-3d0/gpuclk or
@@ -141,7 +163,7 @@ object GpuScripts {
                 CUR_FREQ="${'$'}GED"
                 FREQ_AVAILABLE=1
             fi
-            for f in "$path/cur_freq" "$path/cur_frequency" "$(dirname "$path")/cur_freq" "/sys/class/kgsl/kgsl-3d0/gpuclk" "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq" "/sys/class/devfreq/kgsl-3d0/cur_freq" "/sys/class/devfreq/${'$'}BASE/cur_freq" "/sys/devices/platform/soc/${'$'}SOC_ADDR/kgsl/kgsl-3d0/gpuclk" "/sys/devices/platform/soc/${'$'}SOC_ADDR/kgsl/kgsl-3d0/devfreq/cur_freq"; do
+            for f in "$path/cur_freq" "$path/cur_frequency" "$path/gpu_clock" "$(dirname "$path")/cur_freq" "/sys/class/kgsl/kgsl-3d0/gpuclk" "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq" "/sys/class/devfreq/kgsl-3d0/cur_freq" "/sys/class/devfreq/${'$'}BASE/cur_freq" "/sys/devices/platform/soc/${'$'}SOC_ADDR/kgsl/kgsl-3d0/gpuclk" "/sys/devices/platform/soc/${'$'}SOC_ADDR/kgsl/kgsl-3d0/devfreq/cur_freq"; do
                 [ -n "${'$'}CUR_FREQ" ] && break
                 v=$(cat "${'$'}f" 2>/dev/null | tr -d '[:space:]')
                 if [ -n "${'$'}v" ] && [ "${'$'}v" != "0" ]; then
@@ -153,8 +175,8 @@ object GpuScripts {
             echo "CUR_FREQ=${'$'}CUR_FREQ"
             echo "FREQ_AVAILABLE=${'$'}FREQ_AVAILABLE"
 
-            echo "MIN_FREQ=$(cat "$path/min_freq" 2>/dev/null)"
-            echo "MAX_FREQ=$(cat "$path/max_freq" 2>/dev/null)"
+            echo "MIN_FREQ=$(cat "$path/min_freq" 2>/dev/null || cat "$path/scaling_min_freq" 2>/dev/null || cat "$path/gpu_min_clock" 2>/dev/null)"
+            echo "MAX_FREQ=$(cat "$path/max_freq" 2>/dev/null || cat "$path/scaling_max_freq" 2>/dev/null || cat "$path/gpu_max_clock" 2>/dev/null)"
             echo "TARGET_FREQ=$(cat "$path/target_freq" 2>/dev/null)"
             # Prefer the real OPP table. If unavailable, expose only points that
             # the driver actually reports; never invent compatibility values.
@@ -173,17 +195,24 @@ object GpuScripts {
             echo "AVAIL_FREQ=${'$'}AVAIL_FREQ"
 
             # Load Calculation
-            LOAD=0
-            # Try standard load file
-            if [ -f "$path/load" ]; then
-                LOAD=$(cat "$path/load" | tr -d '%')
-            else
-                # Try vendor specific
-                if echo "$path" | grep -q "mali"; then
-                    if [ -f "/sys/kernel/ged/hal/gpu_utilization" ]; then
-                         LOAD=$(cat "/sys/kernel/ged/hal/gpu_utilization")
+            LOAD=""
+            # MediaTek: devfreq `load` can stay frozen while GED tracks real utilization.
+            if echo "$path" | grep -q "mali" && [ -f "/sys/kernel/ged/hal/gpu_utilization" ]; then
+                LOAD=$(cat "/sys/kernel/ged/hal/gpu_utilization" 2>/dev/null)
+            fi
+            # Standard devfreq load, then Tensor (utilisation) and Exynos (gpu_busy) nodes
+            if [ -z "${'$'}LOAD" ]; then
+                PARENT=$(dirname "$(dirname "$path")")
+                for f in "$path/load" "$path/utilisation" "$path/utilization" "$path/gpu_busy" "${'$'}PARENT/utilisation" "${'$'}PARENT/utilization"; do
+                    if [ -f "${'$'}f" ]; then
+                        LOAD=$(cat "${'$'}f" 2>/dev/null | tr -d '%')
+                        [ -n "${'$'}LOAD" ] && break
                     fi
-                elif echo "$path" | grep -q "kgsl"; then
+                done
+            fi
+            if [ -z "${'$'}LOAD" ]; then
+                LOAD=0
+                if echo "$path" | grep -q "kgsl"; then
                      # Adreno gpubusy - usually at ../gpubusy relative to devfreq
                      # gpubusy lives under /sys/class/kgsl/kgsl-3d0, not the devfreq parent.
                      for GB in "/sys/class/kgsl/kgsl-3d0/gpubusy" "$(dirname "$path")/gpubusy"; do
