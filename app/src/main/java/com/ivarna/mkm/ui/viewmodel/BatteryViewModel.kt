@@ -9,21 +9,28 @@ import android.os.Build
 import android.os.IBinder
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.ivarna.mkm.data.model.BatteryDrainer
 import com.ivarna.mkm.data.model.BatterySessionRecord
 import com.ivarna.mkm.data.model.BatteryStats
+import com.ivarna.mkm.data.provider.BatteryProvider
 import com.ivarna.mkm.service.BatteryMonitorService
+import com.ivarna.mkm.service.BatterySessionTracker
+import com.ivarna.mkm.util.AppVisibilityMonitor
+import com.ivarna.mkm.utils.BatteryHistoryManager
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * ViewModel for the Battery screen.
  *
- * Binds to [BatteryMonitorService] to observe live battery stats.
- * The service outlives the UI, so the persistent notification keeps
- * updating even when the app is closed or in the background.
+ * Binds to [BatteryMonitorService] only while the app is in the foreground, so the
+ * tracker does not keep polling for a backgrounded UI. With the persistent notification
+ * enabled the service is started and keeps running on its own.
  */
 class BatteryViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -32,47 +39,52 @@ class BatteryViewModel(application: Application) : AndroidViewModel(application)
         private const val PREF_NOTIFICATION_ENABLED = BatteryMonitorService.PREF_NOTIFICATION_ENABLED
     }
 
+    private val prefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val historyManager = BatteryHistoryManager.get(application)
+
     private val _batteryStats = MutableStateFlow<BatteryStats?>(null)
     val batteryStats: StateFlow<BatteryStats?> = _batteryStats.asStateFlow()
 
     private val _showNotification = MutableStateFlow(false)
     val showNotification: StateFlow<Boolean> = _showNotification.asStateFlow()
 
-    private val _history = MutableStateFlow<List<BatterySessionRecord>>(emptyList())
-    val history: StateFlow<List<BatterySessionRecord>> = _history.asStateFlow()
+    /** Shared with the tracker; available before the service binds. */
+    val history: StateFlow<List<BatterySessionRecord>> = historyManager.records
+
+    private val _chargeLimitEnabled = MutableStateFlow(prefs.getBoolean(BatterySessionTracker.PREF_CHARGE_LIMIT_ENABLED, false))
+    val chargeLimitEnabled: StateFlow<Boolean> = _chargeLimitEnabled.asStateFlow()
+
+    private val _chargeLimitPercent = MutableStateFlow(
+        prefs.getInt(BatterySessionTracker.PREF_CHARGE_LIMIT_PERCENT, BatterySessionTracker.DEFAULT_CHARGE_LIMIT).coerceIn(50, 100)
+    )
+    val chargeLimitPercent: StateFlow<Int> = _chargeLimitPercent.asStateFlow()
+
+    private val _drainers = MutableStateFlow<List<BatteryDrainer>>(emptyList())
+    val drainers: StateFlow<List<BatteryDrainer>> = _drainers.asStateFlow()
+
+    private val _drainersLoading = MutableStateFlow(false)
+    val drainersLoading: StateFlow<Boolean> = _drainersLoading.asStateFlow()
 
     private var serviceBound = false
     private var statsCollectionJob: Job? = null
-    private var historyCollectionJob: Job? = null
-    private var boundBinder: BatteryMonitorService.LocalBinder? = null
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val binder = service as BatteryMonitorService.LocalBinder
-            boundBinder = binder
             statsCollectionJob?.cancel()
             statsCollectionJob = viewModelScope.launch {
                 binder.stats.collect { stats ->
                     _batteryStats.value = stats
                 }
             }
-            historyCollectionJob?.cancel()
-            historyCollectionJob = viewModelScope.launch {
-                binder.history.collect { records ->
-                    _history.value = records
-                }
-            }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             statsCollectionJob?.cancel()
-            historyCollectionJob?.cancel()
-            boundBinder = null
         }
     }
 
     init {
-        val prefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         _showNotification.value = prefs.getBoolean(PREF_NOTIFICATION_ENABLED, false)
 
         if (_showNotification.value) {
@@ -86,13 +98,16 @@ class BatteryViewModel(application: Application) : AndroidViewModel(application)
             }
         }
 
-        bindToService()
+        viewModelScope.launch {
+            AppVisibilityMonitor.isForeground.collect { foreground ->
+                if (foreground) bindToService() else unbindFromService()
+            }
+        }
     }
 
     fun setNotificationEnabled(enabled: Boolean) {
         _showNotification.value = enabled
-        getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit()
+        prefs.edit()
             .putBoolean(PREF_NOTIFICATION_ENABLED, enabled)
             .apply()
 
@@ -106,30 +121,53 @@ class BatteryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    fun setChargeLimitEnabled(enabled: Boolean) {
+        _chargeLimitEnabled.value = enabled
+        prefs.edit().putBoolean(BatterySessionTracker.PREF_CHARGE_LIMIT_ENABLED, enabled).apply()
+    }
+
+    fun setChargeLimitPercent(percent: Int) {
+        val safe = percent.coerceIn(50, 100)
+        _chargeLimitPercent.value = safe
+        prefs.edit().putInt(BatterySessionTracker.PREF_CHARGE_LIMIT_PERCENT, safe).apply()
+    }
+
+    /** Manual only: dumpsys batterystats is expensive, never polled. */
+    fun refreshDrainers() {
+        if (_drainersLoading.value) return
+        _drainersLoading.value = true
+        viewModelScope.launch {
+            _drainers.value = withContext(Dispatchers.IO) {
+                runCatching { BatteryProvider.readTopDrainers(getApplication<Application>()) }.getOrDefault(emptyList())
+            }
+            _drainersLoading.value = false
+        }
+    }
+
     fun clearHistory() {
-        boundBinder?.clearHistory()
-        // Optimistic local update so the UI clears immediately; the binder
-        // flow will replace it shortly with the canonical empty list.
-        _history.value = emptyList()
+        // Same instance the tracker writes to, so this clears the file whether or not we are bound.
+        viewModelScope.launch(Dispatchers.IO) { historyManager.clear() }
     }
 
     override fun onCleared() {
         super.onCleared()
-        statsCollectionJob?.cancel()
-        historyCollectionJob?.cancel()
-        if (serviceBound) {
-            getApplication<Application>().unbindService(serviceConnection)
-            serviceBound = false
-        }
+        unbindFromService()
     }
 
     private fun bindToService() {
+        if (serviceBound) return
         val intent = Intent(getApplication(), BatteryMonitorService::class.java)
-        getApplication<Application>().bindService(
+        serviceBound = getApplication<Application>().bindService(
             intent,
             serviceConnection,
             Context.BIND_AUTO_CREATE
         )
-        serviceBound = true
+    }
+
+    private fun unbindFromService() {
+        statsCollectionJob?.cancel()
+        if (!serviceBound) return
+        runCatching { getApplication<Application>().unbindService(serviceConnection) }
+        serviceBound = false
     }
 }

@@ -26,6 +26,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ivarna.mkm.data.model.BenchmarkStatus
 import com.ivarna.mkm.data.model.CpuEfficiencyResult
@@ -77,7 +78,7 @@ fun PowerScreen(
     
     // Show real-time progress dialog when running
     if (cpuStatus is BenchmarkStatus.Running || gpuStatus is BenchmarkStatus.Running) {
-        RealTimeProgressDialog(logs = realTimeLogs)
+        RealTimeProgressDialog(logs = realTimeLogs, gpuLoad = gpuStatus is BenchmarkStatus.Running)
     }
 
     Scaffold(
@@ -160,7 +161,7 @@ fun PowerScreen(
                     onViewRawData = {
                          // We can iterate results to reconstruct CSV or use what is in logs (but logs has mix).
                          // Let's generate CSV from results structure for clean Raw Data view.
-                         val header = "Policy,Frequency_KHz,Duration_Sec,Score,Power_uW,Efficiency\n"
+                         val header = "Policy,Frequency_KHz,Duration_Sec,Score,Power_W,Efficiency\n"
                          val rows = cpuResults.map { r ->
                              "${r.policy},${r.frequencyKHz},${r.durationSec},${r.score},${r.powerW},${r.efficiency}"
                          }.joinToString("\n")
@@ -180,9 +181,9 @@ fun PowerScreen(
                         showLogDialog = true
                     },
                     onViewRawData = {
-                         val header = "Frequency_Hz,Score(Util),Power_W\n"
-                         val body = gpuResults.joinToString("\n") { 
-                             "${it.frequencyHz},${it.utilization},${it.powerW}"
+                         val header = "Frequency_Hz,Util_Percent,Power_W,Efficiency\n"
+                         val body = gpuResults.joinToString("\n") {
+                             "${it.frequencyHz},${it.utilization},${it.powerW},${it.efficiency}"
                          }
                          logContent = header + body
                          isRawDataMode = true
@@ -423,17 +424,6 @@ fun GpuBenchTab(
                  ElevatedCard(shape = RoundedCornerShape(24.dp)) {
                     Column(modifier = Modifier.padding(16.dp)) {
                         Text(stringResource(com.ivarna.mkm.R.string.power_curve), style = MaterialTheme.typography.titleMedium)
-                        
-                         // The user said Y axis score? 
-                         // "x axis power and y axis score. and a curve of pwer efficiency we get"
-                         // They likely want Efficiency on Y axis.
-                         // But we calculated 0 efficiency for GPU. 
-                         // Let's fix this visual: Show Power vs Freq as currently implemented, OR manually approximate eff.
-                         // Let's just show what we have but label it clearly.
-                         // Actually, if we invert x/y... User mentioned "x axis power".
-                         // Usually X = Freq (independent), Y = Power (dependent). 
-                         // Efficiency graph should occur if we have metrics.
-                         
                          val points = results.map { it.frequencyHz.toFloat() to it.powerW }
                          EfficiencyGraph(
                             dataPoints = points,
@@ -447,10 +437,6 @@ fun GpuBenchTab(
                     }
                  }
             }
-        }
-        
-        if (status is BenchmarkStatus.Running) {
-             com.ivarna.mkm.ui.components.GpuStressView(modifier = Modifier.fillMaxSize())
         }
     }
 }
@@ -494,12 +480,21 @@ fun StatusMessage(
 }
 
 @Composable
-fun RealTimeProgressDialog(logs: String) {
-    Dialog(onDismissRequest = {}) {
+fun RealTimeProgressDialog(logs: String, gpuLoad: Boolean = false) {
+    // GPU bench: render the stress shader full-screen in the dialog window itself so it is
+    // the visible top surface (a GLSurfaceView behind a dialog may be throttled).
+    Dialog(onDismissRequest = {}, properties = DialogProperties(usePlatformDefaultWidth = !gpuLoad)) {
+      Box(
+          modifier = if (gpuLoad) Modifier.fillMaxSize() else Modifier,
+          contentAlignment = Alignment.Center
+      ) {
+        if (gpuLoad) {
+            com.ivarna.mkm.ui.components.GpuStressView(modifier = Modifier.fillMaxSize())
+        }
         Card(
             shape = RoundedCornerShape(16.dp),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            modifier = Modifier.fillMaxWidth().height(300.dp)
+            modifier = Modifier.padding(horizontal = if (gpuLoad) 24.dp else 0.dp).fillMaxWidth().height(300.dp)
         ) {
             Column(modifier = Modifier.padding(24.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -520,6 +515,7 @@ fun RealTimeProgressDialog(logs: String) {
                 }
             }
         }
+      }
     }
 }
 

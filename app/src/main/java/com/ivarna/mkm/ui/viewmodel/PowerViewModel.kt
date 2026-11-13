@@ -71,7 +71,7 @@ class PowerViewModel(application: Application) : AndroidViewModel(application) {
 
     fun saveCalibrationMultiplier(multiplier: Float) {
         calibrationManager.saveMultiplier(multiplier)
-        _calibrationMultiplier.value = multiplier
+        _calibrationMultiplier.value = calibrationManager.getMultiplier()
         // Kick off a poll immediately so the Power screen reflects the new value right away
         startMonitoring()
     }
@@ -86,9 +86,19 @@ class PowerViewModel(application: Application) : AndroidViewModel(application) {
     private val _realTimeLogs = MutableStateFlow("")
     val realTimeLogs: StateFlow<String> = _realTimeLogs.asStateFlow()
 
+    /** Charger current masks real draw; refuse instead of reporting bogus watts. */
+    private fun refuseWhileCharging(status: MutableStateFlow<BenchmarkStatus>): Boolean {
+        if (!powerProvider.isPluggedIn()) return false
+        status.value = BenchmarkStatus.Error(
+            getApplication<Application>().getString(com.ivarna.mkm.R.string.benchmark_unplug_charger)
+        )
+        return true
+    }
+
     fun runCpuBenchmark() {
         if (_cpuBenchStatus.value is BenchmarkStatus.Running) return
-        
+        if (refuseWhileCharging(_cpuBenchStatus)) return
+
         _realTimeLogs.value = "Starting CPU Benchmark..."
         
         viewModelScope.launch {
@@ -114,7 +124,8 @@ class PowerViewModel(application: Application) : AndroidViewModel(application) {
     
     fun runGpuBenchmark() {
         if (_gpuBenchStatus.value is BenchmarkStatus.Running) return
-        
+        if (refuseWhileCharging(_gpuBenchStatus)) return
+
         _realTimeLogs.value = "Starting GPU Benchmark..."
         
         viewModelScope.launch {

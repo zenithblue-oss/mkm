@@ -3,7 +3,6 @@ package com.ivarna.mkm.receiver
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.os.BatteryManager
 import android.util.Log
 import com.ivarna.mkm.shell.ShellManager
 import com.ivarna.mkm.utils.BatteryStatsResetPrefs
@@ -13,47 +12,37 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 /**
- * Resets the system battery stats (`dumpsys batterystats --reset`) on three
- * user-enabled triggers, each gated by [BatteryStatsResetPrefs]:
- *   - [Intent.ACTION_POWER_DISCONNECTED] (charger unplugged)
- *   - [Intent.ACTION_BATTERY_CHANGED] with [BatteryManager.EXTRA_STATUS] == FULL (100% reached)
- *   - [Intent.ACTION_BOOT_COMPLETED] (device reboot)
+ * Resets the system battery stats (`dumpsys batterystats --reset`) on user-enabled triggers,
+ * each gated by [BatteryStatsResetPrefs]:
+ *   - boot: this manifest receiver ([Intent.ACTION_BOOT_COMPLETED]).
+ *   - unplug / full: fired by [com.ivarna.mkm.service.BatterySessionTracker] via [resetStats].
+ *     Manifest receivers never get ACTION_POWER_DISCONNECTED / BATTERY_CHANGED on Android 8+.
  *
- * Execution uses [ShellManager.exec] which already does shizuku → root → local
- * fallback. If neither shizuku nor root is available, the reset silently fails
- * (better than spamming toasts from BOOT_COMPLETED).
+ * Execution uses [ShellManager.exec] (shizuku → root → local). Without either backend the
+ * reset silently fails (better than spamming toasts from BOOT_COMPLETED).
  */
 class BatteryStatsResetReceiver : BroadcastReceiver() {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
     override fun onReceive(context: Context, intent: Intent) {
-        val action = intent.action ?: return
-        val prefs = BatteryStatsResetPrefs
-
-        when (action) {
-            Intent.ACTION_POWER_DISCONNECTED -> {
-                if (!prefs.isOnUnplug(context)) return
-            }
-            Intent.ACTION_BATTERY_CHANGED -> {
-                if (!prefs.isOnFull(context)) return
-                val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
-                if (status != BatteryManager.BATTERY_STATUS_FULL) return
-            }
-            Intent.ACTION_BOOT_COMPLETED -> {
-                if (!prefs.isOnBoot(context)) return
-            }
-            else -> return
-        }
-
-        val trigger = when (action) {
-            Intent.ACTION_POWER_DISCONNECTED -> "unplug"
-            Intent.ACTION_BATTERY_CHANGED -> "full"
-            Intent.ACTION_BOOT_COMPLETED -> "boot"
-            else -> return
-        }
-
+        if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+        if (!BatteryStatsResetPrefs.isOnBoot(context)) return
+        val appContext = context.applicationContext
+        val pending = goAsync()
         scope.launch {
+            try {
+                resetStats(appContext, "boot")
+            } finally {
+                pending.finish()
+            }
+        }
+    }
+
+    companion object {
+        private const val TAG = "BatteryStatsReset"
+        private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+        /** Blocking shell call — run off the main thread. */
+        fun resetStats(context: Context, trigger: String): Boolean {
             val result = ShellManager.exec("dumpsys batterystats --reset")
             if (result.isSuccess) {
                 Log.i(TAG, "battery stats reset OK (trigger=$trigger)")
@@ -61,10 +50,7 @@ class BatteryStatsResetReceiver : BroadcastReceiver() {
             } else {
                 Log.w(TAG, "battery stats reset failed (trigger=$trigger, exit=${result.exitCode}, err=${result.stderr})")
             }
+            return result.isSuccess
         }
-    }
-
-    companion object {
-        private const val TAG = "BatteryStatsReset"
     }
 }

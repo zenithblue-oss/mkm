@@ -21,7 +21,21 @@ data class BatterySnapshot(
     val calibrationMultiplier: Float = 1.0f,
     val ratedCapacityMah: Int = 0,
     val estimatedCapacityMah: Int = 0,
-    val timestampMs: Long = System.currentTimeMillis()
+    val timestampMs: Long = System.currentTimeMillis(),
+    val cycleCount: Int = -1,
+    /** [android.os.BatteryManager] BATTERY_HEALTH_* code from the sticky intent. */
+    val health: Int = 0,
+    /** Raw sysfs charge_type (e.g. "Fast"), empty when unavailable. */
+    val chargeType: String = "",
+    val isFull: Boolean = false
+)
+
+/** One app's estimated consumption from `dumpsys batterystats --checkin` (since last charge). */
+data class BatteryDrainer(
+    val uid: Int,
+    val packageName: String,
+    val label: String,
+    val mah: Double
 )
 
 /**
@@ -83,7 +97,12 @@ data class BatteryStats(
     // Charging-session specific fields
     val chargingSessionStartPercent: Int = 0,
     val chargingGainedPercent: Int = 0,
-    val chargingAvgCurrentMa: Int = 0
+    val chargingAvgCurrentMa: Int = 0,
+    val cycleCount: Int = -1,
+    val health: Int = 0,
+    val chargeType: String = "",
+    /** True when a writable vendor charge-control node was found (root). */
+    val chargeLimitSupported: Boolean = false
 )
 
 /**

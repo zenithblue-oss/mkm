@@ -17,6 +17,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.ivarna.mkm.data.model.PowerStatus
+import com.ivarna.mkm.data.provider.PowerCalibrationManager
 
 @Composable
 fun PowerCalibrationComponent(
@@ -32,7 +33,7 @@ fun PowerCalibrationComponent(
     LaunchedEffect(savedMultiplier) {
         multiplierText = savedMultiplier.toString()
     }
-    val currentMultiplier = multiplierText.toFloatOrNull() ?: savedMultiplier
+    val currentMultiplier = PowerCalibrationManager.parseMultiplier(multiplierText) ?: savedMultiplier
     val calibratedPower = status.powerW * currentMultiplier
     val polaritySign = if (status.isCharging) "+" else "-"
 
@@ -129,10 +130,9 @@ fun PowerCalibrationComponent(
 
                 Button(
                     onClick = {
-                        // Normalise decimal separator for locales that use comma
-                        val normalised = multiplierText.trim().replace(',', '.')
-                        val v = normalised.toFloatOrNull()
-                        if (v != null && v > 0f) {
+                        // Comma decimal separator accepted; clamped to 0.1..1000
+                        val v = PowerCalibrationManager.parseMultiplier(multiplierText)
+                        if (v != null) {
                             multiplierText = v.toString()
                             saveError = false
                             onSaveMultiplier(v)
@@ -152,6 +152,11 @@ fun PowerCalibrationComponent(
             Spacer(modifier = Modifier.height(8.dp))
             Text(
                 text = stringResource(com.ivarna.mkm.R.string.adjust_multiplier_desc),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+            )
+            Text(
+                text = stringResource(com.ivarna.mkm.R.string.calibration_watts_only),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
             )

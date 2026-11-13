@@ -21,7 +21,41 @@ class PowerProvider(private val context: Context? = null) {
     companion object {
         /** Raw (pre-calibration) power above this is treated as invalid sensor data. */
         private const val MAX_PLAUSIBLE_POWER_W = 100f
+
+        /**
+         * Normalize OEM unit quirks to µA / µV (magnitudes).
+         * Kernel standard is µA + µV; some devices expose mA + mV.
+         */
+        fun normalizeCurrentVoltage(currentRaw: Long, voltageRaw: Long): Pair<Long, Long> {
+            val absI = abs(currentRaw)
+            val absV = abs(voltageRaw)
+
+            val voltageUv = when {
+                absV in 1_000_000L..50_000_000L -> absV           // already µV (~1–50 V)
+                absV in 1_000L..50_000L -> absV * 1_000L           // mV → µV
+                else -> absV
+            }
+
+            val currentUa = when {
+                // mV-scale voltage + small current → treat current as mA
+                absV in 1_000L..50_000L && absI in 1L until 20_000L -> absI * 1_000L
+                else -> absI // assume µA
+            }
+
+            return currentUa to voltageUv
+        }
+
+        /** Power (W) = |I_µA| × V_µV / 1e12 — Double intermediate avoids Long overflow. */
+        fun computePowerWatts(currentUa: Long, voltageUv: Long): Float {
+            if (currentUa == 0L || voltageUv == 0L) return 0f
+            val watts = (currentUa.toDouble() * voltageUv.toDouble()) / 1_000_000_000_000.0
+            if (watts.isNaN() || watts.isInfinite() || watts < 0.0) return 0f
+            return watts.toFloat()
+        }
     }
+
+    /** Android plugged/charging state; benchmarks refuse to run while true. */
+    fun isPluggedIn(): Boolean = readAndroidBatteryState().isCharging
 
     /**
      * Live power reading used by **Power page**, **Overlay PWR**, Settings calibration,
@@ -98,37 +132,6 @@ class PowerProvider(private val context: Context? = null) {
             e.printStackTrace()
             AndroidBatteryState()
         }
-    }
-
-    /**
-     * Normalize OEM unit quirks to µA / µV.
-     * Kernel standard is µA + µV; some devices expose mA + mV.
-     */
-    private fun normalizeCurrentVoltage(currentRaw: Long, voltageRaw: Long): Pair<Long, Long> {
-        val absI = abs(currentRaw)
-        val absV = abs(voltageRaw)
-
-        val voltageUv = when {
-            absV in 1_000_000L..50_000_000L -> absV           // already µV (~1–50 V)
-            absV in 1_000L..50_000L -> absV * 1_000L           // mV → µV
-            else -> absV
-        }
-
-        val currentUa = when {
-            // mV-scale voltage + small current → treat current as mA
-            absV in 1_000L..50_000L && absI in 1L until 20_000L -> absI * 1_000L
-            else -> absI // assume µA
-        }
-
-        return currentUa to voltageUv
-    }
-
-    /** Power (W) = |I_µA| × V_µV / 1e12 — Double intermediate avoids Long overflow. */
-    private fun computePowerWatts(currentUa: Long, voltageUv: Long): Float {
-        if (currentUa == 0L || voltageUv == 0L) return 0f
-        val watts = (currentUa.toDouble() * voltageUv.toDouble()) / 1_000_000_000_000.0
-        if (watts.isNaN() || watts.isInfinite() || watts < 0.0) return 0f
-        return watts.toFloat()
     }
 
     /**
@@ -535,6 +538,9 @@ class PowerProvider(private val context: Context? = null) {
         ShellManager.exec("echo \"$scriptBase64\" | base64 -d > $scriptPath")
         ShellManager.exec("chmod +x $scriptPath")
         
+        // GpuStressView renders while status is Running; give it time to ramp the GPU.
+        onProgress("Warming up GPU load...")
+        delay(1500)
         onProgress("Starting Benchmark...")
         sb.appendLine("Running GPU Benchmark...")
         
@@ -561,13 +567,15 @@ class PowerProvider(private val context: Context? = null) {
             val parts = line.split(",")
              if (parts.size >= 5) {
                 try {
-                    // Frequency_Hz,Duration_Sec,Score,Power_W,Efficiency_ScorePerWatt
+                    // Frequency_Hz,Duration_Sec,Util_Percent,Power_W,Efficiency
                     val freq = parts[0].toLongOrNull() ?: 0L
-                    val util = parts[2].toFloatOrNull() ?: 0f 
+                    val util = parts[2].toFloatOrNull() ?: 0f
                     val rawPower = parts[3].toFloatOrNull() ?: 0f
                     val power = rawPower * multiplier
-                    
-                    val efficiency = if (power > 0) util / power else 0f
+
+                    // Effective GPU throughput = busy fraction × clock (MHz); per watt.
+                    val freqMhz = if (freq > 100_000L) freq / 1_000_000f else freq.toFloat()
+                    val efficiency = if (power > 0) (util / 100f * freqMhz) / power else 0f
                     results.add(GpuEfficiencyResult(freq, util, power, efficiency))
                 } catch (e: Exception) {
                     continue

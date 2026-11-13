@@ -21,12 +21,20 @@ import java.util.concurrent.atomic.AtomicLong
  * the in-memory snapshot consistent with the file. The in-memory snapshot is
  * also exposed as a [StateFlow] so the UI updates immediately on save/clear.
  */
-class BatteryHistoryManager(context: Context) {
+class BatteryHistoryManager private constructor(context: Context) {
 
     companion object {
         const val FILE_NAME = "battery_history.json"
         const val MAX_RECORDS = 100
         private const val VERSION = 1
+
+        @Volatile private var instance: BatteryHistoryManager? = null
+
+        /** Process-wide instance so the UI and the tracker share one in-memory list and file. */
+        fun get(context: Context): BatteryHistoryManager =
+            instance ?: synchronized(this) {
+                instance ?: BatteryHistoryManager(context).also { instance = it }
+            }
     }
 
     private val appContext = context.applicationContext
@@ -176,6 +184,8 @@ class BatteryHistoryManager(context: Context) {
             put("avgCurrentMa", rec.avgCurrentMa)
             put("avgWattageW", rec.avgWattageW.toDouble())
             put("avgTemperatureC", rec.avgTemperatureC.toDouble())
+            put("ratedCapacityMah", rec.ratedCapacityMah)
+            put("estimatedCapacityMah", rec.estimatedCapacityMah)
         }
     }
 
@@ -202,7 +212,9 @@ class BatteryHistoryManager(context: Context) {
                 idleDrainPerHr = obj.optDouble("idleDrainPerHr", 0.0).toFloat(),
                 avgCurrentMa = obj.optInt("avgCurrentMa"),
                 avgWattageW = obj.optDouble("avgWattageW", 0.0).toFloat(),
-                avgTemperatureC = obj.optDouble("avgTemperatureC", 0.0).toFloat()
+                avgTemperatureC = obj.optDouble("avgTemperatureC", 0.0).toFloat(),
+                ratedCapacityMah = obj.optInt("ratedCapacityMah", 0),
+                estimatedCapacityMah = obj.optInt("estimatedCapacityMah", 0)
             )
         }.getOrNull()
     }

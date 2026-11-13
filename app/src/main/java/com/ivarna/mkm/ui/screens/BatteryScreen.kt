@@ -3,7 +3,15 @@ import androidx.compose.ui.res.stringResource
 
 import android.Manifest
 import android.content.Context
+import android.os.BatteryManager
 import android.os.Build
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.style.TextOverflow
+import com.ivarna.mkm.data.model.BatteryDrainer
+import com.ivarna.mkm.service.BatterySessionTracker
+import kotlin.math.roundToInt
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
@@ -60,6 +68,10 @@ fun BatteryScreen(
 ) {
     val stats by viewModel.batteryStats.collectAsState()
     val sessionHistory by viewModel.history.collectAsState()
+    val chargeLimitEnabled by viewModel.chargeLimitEnabled.collectAsState()
+    val chargeLimitPercent by viewModel.chargeLimitPercent.collectAsState()
+    val drainers by viewModel.drainers.collectAsState()
+    val drainersLoading by viewModel.drainersLoading.collectAsState()
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
     val snackbarHostState = remember { SnackbarHostState() }
     val context = LocalContext.current
@@ -105,7 +117,17 @@ fun BatteryScreen(
 
                 Spacer(modifier = Modifier.height(24.dp))
                 SectionHeader(stringResource(com.ivarna.mkm.R.string.capacity))
-                CapacityCard(stats = data)
+                CapacityCard(stats = data, records = sessionHistory)
+
+                Spacer(modifier = Modifier.height(24.dp))
+                SectionHeader(stringResource(com.ivarna.mkm.R.string.charge_limit))
+                ChargeLimitCard(
+                    supported = data.chargeLimitSupported,
+                    enabled = chargeLimitEnabled,
+                    percent = chargeLimitPercent,
+                    onEnabledChange = viewModel::setChargeLimitEnabled,
+                    onPercentChange = viewModel::setChargeLimitPercent
+                )
 
                 if (data.wattageHistory.isNotEmpty() || data.isSessionActive || sessionHistory.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(24.dp))
@@ -120,6 +142,14 @@ fun BatteryScreen(
                 Spacer(modifier = Modifier.height(24.dp))
                 SectionHeader(stringResource(com.ivarna.mkm.R.string.session_breakdown))
                 TimeBreakdownCard(stats = data)
+
+                Spacer(modifier = Modifier.height(24.dp))
+                SectionHeader(stringResource(com.ivarna.mkm.R.string.top_drainers))
+                TopDrainersCard(
+                    drainers = drainers,
+                    loading = drainersLoading,
+                    onRefresh = viewModel::refreshDrainers
+                )
 
                 Spacer(modifier = Modifier.height(32.dp))
             } ?: run {
@@ -136,14 +166,16 @@ fun BatteryScreen(
 
 @Composable
 fun BatteryHeroCard(stats: BatteryStats) {
+    // Plugged but net discharging (currentMa < 0) reads as discharging.
+    val chargingNow = stats.isCharging && stats.currentMa >= 0
     val statusText = when {
-        stats.isCharging -> stringResource(com.ivarna.mkm.R.string.charging)
+        chargingNow -> stringResource(com.ivarna.mkm.R.string.charging)
         stats.isSessionActive -> stringResource(com.ivarna.mkm.R.string.discharging_ma_format, kotlin.math.abs(stats.currentMa))
         else -> stringResource(com.ivarna.mkm.R.string.on_ac)
     }
 
     val statusColor = when {
-        stats.isCharging -> Color(0xFF4CAF50)
+        chargingNow -> Color(0xFF4CAF50)
         stats.percent <= 15 -> MaterialTheme.colorScheme.error
         else -> MaterialTheme.colorScheme.primary
     }
@@ -177,7 +209,7 @@ fun BatteryHeroCard(stats: BatteryStats) {
                     )
                 }
                 Icon(
-                    imageVector = if (stats.isCharging) Icons.Default.Power else Icons.Default.BatteryFull,
+                    imageVector = if (chargingNow) Icons.Default.Power else Icons.Default.BatteryFull,
                     contentDescription = null,
                     modifier = Modifier.size(48.dp),
                     tint = statusColor
@@ -208,7 +240,7 @@ fun BatteryHeroCard(stats: BatteryStats) {
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    val wattageColor = if (stats.isCharging)
+                    val wattageColor = if (chargingNow)
                         Color(0xFF4CAF50)
                     else
                         MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f)
@@ -284,7 +316,7 @@ fun EstimatedTimeCard(stats: BatteryStats) {
 }
 
 @Composable
-fun CapacityCard(stats: BatteryStats) {
+fun CapacityCard(stats: BatteryStats, records: List<BatterySessionRecord> = emptyList()) {
     ElevatedCard(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
@@ -293,7 +325,8 @@ fun CapacityCard(stats: BatteryStats) {
         )
     ) {
         Column(modifier = Modifier.padding(20.dp)) {
-            val showRated = stats.ratedCapacityMah > 0 && stats.ratedCapacityMah != stats.estimatedCapacityMah
+            // Rated is only set from sysfs charge_full_design; equal values mean 100% health.
+            val showRated = stats.ratedCapacityMah > 0
 
             if (showRated) {
                 CapacityRow(
@@ -314,7 +347,7 @@ fun CapacityCard(stats: BatteryStats) {
                     color = MaterialTheme.colorScheme.secondary
                 )
 
-                if (stats.ratedCapacityMah > 0 && stats.ratedCapacityMah != stats.estimatedCapacityMah) {
+                if (showRated) {
                     val healthPct = (stats.estimatedCapacityMah * 100f / stats.ratedCapacityMah).coerceIn(0f, 100f)
                     Spacer(modifier = Modifier.height(8.dp))
                     LinearProgressIndicator(
@@ -328,7 +361,7 @@ fun CapacityCard(stats: BatteryStats) {
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "Battery health: ${String.format("%.1f", healthPct)}%",
+                        text = stringResource(com.ivarna.mkm.R.string.battery_health_pct_format, healthPct),
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -345,6 +378,191 @@ fun CapacityCard(stats: BatteryStats) {
                     text = stringResource(com.ivarna.mkm.R.string.capacity_unavailable),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
+            if (stats.cycleCount >= 0) {
+                HealthInfoRow(stringResource(com.ivarna.mkm.R.string.cycle_count), stats.cycleCount.toString())
+            }
+            HealthInfoRow(stringResource(com.ivarna.mkm.R.string.health_status), stringResource(healthLabelRes(stats.health)))
+            if (stats.chargeType.isNotBlank()) {
+                HealthInfoRow(stringResource(com.ivarna.mkm.R.string.charge_type), stats.chargeType)
+            }
+
+            // Health over time: charge_full / design per saved session.
+            val trend = remember(records) {
+                records.filter { it.ratedCapacityMah > 0 && it.estimatedCapacityMah > 0 }
+                    .sortedBy { it.endTimeMs }
+                    .map { (it.estimatedCapacityMah * 100f / it.ratedCapacityMah).coerceIn(0f, 100f) }
+            }
+            if (trend.size >= 2) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    text = stringResource(com.ivarna.mkm.R.string.health_trend),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                val lo = trend.min() - 1f
+                val hi = trend.max() + 1f
+                Sparkline(
+                    history = trend.map { (it - lo) / (hi - lo) },
+                    color = MaterialTheme.colorScheme.secondary,
+                    modifier = Modifier.fillMaxWidth().height(48.dp)
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = stringResource(com.ivarna.mkm.R.string.health_trend_range_format, trend.first(), trend.last(), trend.size),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+private fun healthLabelRes(health: Int): Int = when (health) {
+    BatteryManager.BATTERY_HEALTH_GOOD -> com.ivarna.mkm.R.string.health_good
+    BatteryManager.BATTERY_HEALTH_OVERHEAT -> com.ivarna.mkm.R.string.health_overheat
+    BatteryManager.BATTERY_HEALTH_DEAD -> com.ivarna.mkm.R.string.health_dead
+    BatteryManager.BATTERY_HEALTH_OVER_VOLTAGE -> com.ivarna.mkm.R.string.health_over_voltage
+    BatteryManager.BATTERY_HEALTH_UNSPECIFIED_FAILURE -> com.ivarna.mkm.R.string.health_failure
+    BatteryManager.BATTERY_HEALTH_COLD -> com.ivarna.mkm.R.string.health_cold
+    else -> com.ivarna.mkm.R.string.health_unknown
+}
+
+@Composable
+private fun HealthInfoRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(text = label, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(text = value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+fun ChargeLimitCard(
+    supported: Boolean,
+    enabled: Boolean,
+    percent: Int,
+    onEnabledChange: (Boolean) -> Unit,
+    onPercentChange: (Int) -> Unit
+) {
+    var sliderValue by remember(percent) { mutableFloatStateOf(percent.toFloat()) }
+    val shown = sliderValue.roundToInt()
+    ElevatedCard(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow
+        )
+    ) {
+        Column(modifier = Modifier.padding(20.dp)) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .toggleable(value = enabled, role = Role.Switch, onValueChange = onEnabledChange),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (supported) stringResource(com.ivarna.mkm.R.string.charge_limit_stop_format, shown)
+                           else stringResource(com.ivarna.mkm.R.string.charge_limit_notify_format, shown),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f)
+                )
+                Switch(checked = enabled, onCheckedChange = null)
+            }
+            Slider(
+                value = sliderValue,
+                onValueChange = { sliderValue = it },
+                onValueChangeFinished = { onPercentChange(sliderValue.roundToInt()) },
+                valueRange = 50f..100f,
+                steps = 49
+            )
+            Text(
+                text = if (supported) stringResource(com.ivarna.mkm.R.string.charge_limit_resume_format, shown - BatterySessionTracker.CHARGE_LIMIT_HYSTERESIS)
+                       else stringResource(com.ivarna.mkm.R.string.charge_limit_no_node),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = stringResource(com.ivarna.mkm.R.string.charge_limit_background_hint),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+            )
+        }
+    }
+}
+
+@Composable
+fun TopDrainersCard(
+    drainers: List<BatteryDrainer>,
+    loading: Boolean,
+    onRefresh: () -> Unit
+) {
+    ElevatedCard(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow
+        )
+    ) {
+        Column(modifier = Modifier.padding(20.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = stringResource(com.ivarna.mkm.R.string.top_drainers_desc),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f)
+                )
+                if (loading) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 3.dp)
+                } else {
+                    TextButton(onClick = onRefresh) {
+                        Text(stringResource(com.ivarna.mkm.R.string.drainers_refresh))
+                    }
+                }
+            }
+            if (drainers.isEmpty() && !loading) {
+                Text(
+                    text = stringResource(com.ivarna.mkm.R.string.drainers_empty),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            val maxMah = drainers.maxOfOrNull { it.mah }?.takeIf { it > 0.0 } ?: 1.0
+            drainers.forEach { d ->
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = d.label,
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        text = stringResource(com.ivarna.mkm.R.string.drainer_mah_format, d.mah),
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                LinearProgressIndicator(
+                    progress = { (d.mah / maxMah).toFloat() },
+                    modifier = Modifier.fillMaxWidth()
                 )
             }
         }
