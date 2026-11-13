@@ -37,8 +37,14 @@ import androidx.compose.ui.zIndex
 import com.ivarna.mkm.ui.components.*
 import com.ivarna.mkm.service.OverlayService
 import com.ivarna.mkm.utils.FpsSessionRecorder
+import com.ivarna.mkm.utils.FpsSessionExport
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun OverlayScreen(
     onOpenDrawer: () -> Unit = {}
@@ -55,7 +61,9 @@ fun OverlayScreen(
     }
 
     fun notifyService() {
-        if (isOverlayEnabled) {
+        // Use the real service state: the quick settings tile can stop/start it behind this screen,
+        // and startService() here would otherwise silently restart a stopped overlay.
+        if (OverlayService.isRunning) {
             val intent = Intent(context, OverlayService::class.java).apply {
                 action = "UPDATE_SETTINGS"
             }
@@ -83,6 +91,11 @@ fun OverlayScreen(
             }
         } else {
             isOverlayEnabled = prefEnabled && OverlayService.isRunning
+        }
+        // Keep the UI in sync when the overlay is toggled elsewhere (e.g. the quick settings tile)
+        while (true) {
+            kotlinx.coroutines.delay(1000)
+            if (isOverlayEnabled != OverlayService.isRunning) isOverlayEnabled = OverlayService.isRunning
         }
     }
 
@@ -159,9 +172,11 @@ fun OverlayScreen(
         var isGridView by remember { mutableStateOf(prefs.getBoolean("is_grid_view", false)) }
         var isHorizontal by remember { mutableStateOf(prefs.getBoolean("is_horizontal", false)) }
         var showSparklines by remember { mutableStateOf(prefs.getBoolean("show_sparklines", false)) }
-        val defaultOrder = "cpu_usage,cpu_freq,gpu_usage,ram_usage,swap_usage,power_usage,cpu_temp,battery_temp,battery_percent,fps"
-        var componentOrder by remember { 
-            mutableStateOf((prefs.getString("component_order", defaultOrder) ?: defaultOrder).split(",")) 
+        val defaultOrder = "cpu_usage,cpu_freq,gpu_usage,ram_usage,swap_usage,power_usage,cpu_temp,battery_temp,battery_percent,fps,net_speed"
+        var componentOrder by remember {
+            val saved = (prefs.getString("component_order", defaultOrder) ?: defaultOrder).split(",")
+            // Same merge as OverlayService: newly added items (e.g. net_speed) join a saved order
+            mutableStateOf((saved + defaultOrder.split(",").filter { it !in saved }).distinct())
         }
         var gridColumns by remember { mutableStateOf(prefs.getInt("grid_columns", 2)) }
         var updateInterval by remember { 
@@ -186,6 +201,7 @@ fun OverlayScreen(
         var absRam by remember { mutableStateOf(prefs.getBoolean("abs_ram", true)) }
         var absSwap by remember { mutableStateOf(prefs.getBoolean("abs_swap", true)) }
         var showFps by remember { mutableStateOf(prefs.getBoolean("show_fps", false)) }
+        var showNetSpeed by remember { mutableStateOf(prefs.getBoolean("show_net_speed", false)) }
 
         val accentColors = listOf(
             MaterialTheme.colorScheme.primary,
@@ -327,12 +343,45 @@ fun OverlayScreen(
                             notifyService()
                         }
                     )
+                    OverlayToggleItem(
+                        icon = Icons.Default.NetworkCheck,
+                        title = stringResource(com.ivarna.mkm.R.string.net_speed),
+                        checked = showNetSpeed,
+                        onCheckedChange = {
+                            showNetSpeed = it
+                            prefs.edit().putBoolean("show_net_speed", it).apply()
+                            notifyService()
+                        }
+                    )
                 }
             }
 
             item {
                 val isFpsRecording by FpsSessionRecorder.isRecording.collectAsState()
                 val fpsSession by FpsSessionRecorder.session.collectAsState()
+
+                // Session export through the Storage Access Framework: the user picks the file, no permission needed
+                val exportScope = rememberCoroutineScope()
+                val exportSaved = stringResource(com.ivarna.mkm.R.string.fps_export_saved)
+                val exportFailed = stringResource(com.ivarna.mkm.R.string.fps_export_failed)
+                val writeExport: (Uri?, Boolean) -> Unit = { uri, json ->
+                    val session = FpsSessionRecorder.session.value
+                    if (uri != null && session != null) exportScope.launch {
+                        val ok = withContext(Dispatchers.IO) {
+                            runCatching {
+                                val text = if (json) FpsSessionExport.toJson(session) else FpsSessionExport.toCsv(session)
+                                context.contentResolver.openOutputStream(uri)?.use { it.write(text.toByteArray()) } != null
+                            }.getOrDefault(false)
+                        }
+                        snackbarHostState.showSnackbar(if (ok) exportSaved else exportFailed)
+                    }
+                }
+                val csvLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { writeExport(it, false) }
+                val jsonLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { writeExport(it, true) }
+                val exportName = fpsSession?.let { s ->
+                    "mkm_fps_" + (s.targetPkg ?: "session") + "_" +
+                        java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date(s.startedAtMs))
+                } ?: "mkm_fps"
 
                 SettingsSection(title = stringResource(com.ivarna.mkm.R.string.fps_recording)) {
                     Column(
@@ -393,6 +442,21 @@ fun OverlayScreen(
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
                             )
+                        }
+
+                        if (!isFpsRecording && (fpsSession?.samples?.isNotEmpty() == true)) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(onClick = { csvLauncher.launch("$exportName.csv") }) {
+                                    Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(stringResource(com.ivarna.mkm.R.string.fps_export_csv))
+                                }
+                                OutlinedButton(onClick = { jsonLauncher.launch("$exportName.json") }) {
+                                    Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(stringResource(com.ivarna.mkm.R.string.fps_export_json))
+                                }
+                            }
                         }
 
                         fpsSession?.let { session ->
@@ -815,6 +879,48 @@ fun OverlayScreen(
                         )
                     }
 
+                    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                        val statusIconOptions = listOf(
+                            "power" to stringResource(com.ivarna.mkm.R.string.status_icon_power),
+                            "battery_temp" to stringResource(com.ivarna.mkm.R.string.battery_temperature),
+                            "cpu_temp" to stringResource(com.ivarna.mkm.R.string.status_icon_cpu_temp),
+                            "battery_percent" to stringResource(com.ivarna.mkm.R.string.battery_percentage),
+                            "net_speed" to stringResource(com.ivarna.mkm.R.string.net_speed)
+                        )
+                        var statusIconMetrics by remember {
+                            mutableStateOf(OverlayService.parseStatusIconMetrics(prefs.getString(OverlayService.KEY_STATUS_ICON_METRIC, "off")))
+                        }
+                        Text(
+                            stringResource(com.ivarna.mkm.R.string.status_bar_icon),
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            stringResource(com.ivarna.mkm.R.string.status_icon_pick_hint),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            statusIconOptions.forEach { (value, label) ->
+                                val selected = value in statusIconMetrics
+                                FilterChip(
+                                    selected = selected,
+                                    // At the limit, unselected chips are disabled rather than silently replacing a pick
+                                    enabled = selected || statusIconMetrics.size < OverlayService.MAX_STATUS_ICON_METRICS,
+                                    onClick = {
+                                        statusIconMetrics = if (selected) statusIconMetrics - value else statusIconMetrics + value
+                                        prefs.edit().putString(
+                                            OverlayService.KEY_STATUS_ICON_METRIC,
+                                            statusIconMetrics.joinToString(",").ifEmpty { "off" }
+                                        ).apply()
+                                        notifyService()
+                                    },
+                                    label = { Text(label) }
+                                )
+                            }
+                        }
+                    }
+
                     OverlayToggleItem(
                         icon = Icons.Default.OpenWith,
                         title = stringResource(com.ivarna.mkm.R.string.movable_overlay),
@@ -973,7 +1079,8 @@ fun ComponentOrderDialog(
         "cpu_temp" to ("CPU Temperature" to Icons.Default.Thermostat),
         "battery_temp" to ("Battery Temperature" to Icons.Default.BatteryChargingFull),
         "battery_percent" to ("Battery Percentage" to Icons.Default.BatteryStd),
-        "fps" to ("FPS Monitor" to Icons.Default.SlowMotionVideo)
+        "fps" to ("FPS Monitor" to Icons.Default.SlowMotionVideo),
+        "net_speed" to (stringResource(com.ivarna.mkm.R.string.net_speed) to Icons.Default.NetworkCheck)
     )
     
     Dialog(onDismissRequest = onDismiss) {

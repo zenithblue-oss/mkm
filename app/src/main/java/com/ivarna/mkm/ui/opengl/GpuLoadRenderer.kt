@@ -2,6 +2,7 @@ package com.ivarna.mkm.ui.opengl
 
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
+import android.util.Log
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import java.nio.ByteBuffer
@@ -108,7 +109,14 @@ class GpuLoadRenderer : GLSurfaceView.Renderer {
             GLES20.glAttachShader(this, fragmentShader)
             GLES20.glLinkProgram(this)
         }
-        
+        val linked = IntArray(1)
+        GLES20.glGetProgramiv(mProgram, GLES20.GL_LINK_STATUS, linked, 0)
+        if (linked[0] == 0) {
+            Log.e(TAG, "Program link failed: ${GLES20.glGetProgramInfoLog(mProgram)}")
+            GLES20.glDeleteProgram(mProgram)
+            mProgram = 0
+        }
+
         startTime = System.currentTimeMillis()
     }
 
@@ -120,6 +128,7 @@ class GpuLoadRenderer : GLSurfaceView.Renderer {
 
     override fun onDrawFrame(unused: GL10) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        if (mProgram == 0) return
         GLES20.glUseProgram(mProgram)
 
         val positionHandle = GLES20.glGetAttribLocation(mProgram, "vPosition")
@@ -130,7 +139,8 @@ class GpuLoadRenderer : GLSurfaceView.Renderer {
         GLES20.glUniform2f(uResolutionHandle, width.toFloat(), height.toFloat())
         
         uTimeHandle = GLES20.glGetUniformLocation(mProgram, "uTime")
-        val time = (System.currentTimeMillis() - startTime) / 1000f
+        // Wrap so mediump float keeps precision on long stress runs
+        val time = ((System.currentTimeMillis() - startTime) / 1000f) % 1000f
         GLES20.glUniform1f(uTimeHandle, time)
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, vertexCount)
@@ -141,10 +151,14 @@ class GpuLoadRenderer : GLSurfaceView.Renderer {
         return GLES20.glCreateShader(type).also { shader ->
             GLES20.glShaderSource(shader, shaderCode)
             GLES20.glCompileShader(shader)
+            val compiled = IntArray(1)
+            GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0)
+            if (compiled[0] == 0) Log.e(TAG, "Shader compile failed: ${GLES20.glGetShaderInfoLog(shader)}")
         }
     }
 
     companion object {
+        private const val TAG = "GpuLoadRenderer"
         const val COORDS_PER_VERTEX = 2
         var squareCoords = floatArrayOf(
             -1.0f,  1.0f,

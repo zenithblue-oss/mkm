@@ -33,7 +33,6 @@ class GpuViewModel(application: Application) : AndroidViewModel(application) {
     val lastApplyResult = _lastApplyResult.asStateFlow()
 
     private val tuningCoordinator = TuningMutationCoordinator()
-    private var freezeValues = false
 
     init { startMonitoring() }
 
@@ -110,11 +109,6 @@ class GpuViewModel(application: Application) : AndroidViewModel(application) {
         BootSettingsManager.saveGpuSettings(getApplication(), status.governor, status.rawMaxFreq, status.rawMinFreq, status.rawTargetFreq)
     }
 
-    fun toggleFreezeValues(enabled: Boolean) {
-        freezeValues = enabled
-        _gpuStatus.value = _gpuStatus.value.copy(freezeValues = enabled)
-    }
-
     fun refresh() {
         viewModelScope.launch {
             _isRefreshing.value = true
@@ -131,7 +125,7 @@ class GpuViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun publishState() {
         _gpuStatus.value = withContext(Dispatchers.IO) {
-            GpuProvider.getGpuStatus().copy(setOnBoot = _bootEnabled.value, freezeValues = freezeValues)
+            GpuProvider.getGpuStatus().copy(setOnBoot = _bootEnabled.value)
         }
     }
 }

@@ -4,18 +4,28 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.View
 import android.view.ViewTreeObserver
+import com.ivarna.mkm.data.model.FpsSource
 import com.mkm.fps.FpsBinder
 import com.ivarna.mkm.shell.ShellManager
 import java.lang.ref.WeakReference
-import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
 
 object FpsMonitor {
 
     private const val TAG = "FpsMonitor"
 
-    data class FpsResult(val fps: Float, val jankCount: Int)
+    /**
+     * fps: >0 rendering, 0 valid idle, -1 no data (show "N/A").
+     * presentNs/refreshNs carry the raw frame timestamps for frame-time stats when the source has them.
+     */
+    data class FpsResult(
+        val fps: Float,
+        val jankCount: Int = 0,
+        val source: FpsSource? = null,
+        val presentNs: LongArray = LongArray(0),
+        val refreshNs: Long = 0L
+    )
+
+    private val NO_DATA = FpsResult(-1f)
 
     @Volatile private var overlayFps = 0f
     @Volatile private var displayRefreshRate = 60f
@@ -24,12 +34,12 @@ object FpsMonitor {
     private var onPreDrawListener: ViewTreeObserver.OnPreDrawListener? = null
     private var listenerView: WeakReference<View>? = null
 
-    private var drawPacer: ScheduledExecutorService? = null
-    @Volatile private var drawPacerActive = false
-    private var pacerView: WeakReference<View>? = null
-
     private val fpsBinder = FpsBinder()
 
+    /**
+     * Passive overlay redraw-rate estimate, used only without elevated access (labelled "est.").
+     * No draw pacing: the overlay is never forced to redraw just to be measured.
+     */
     fun initOverlayFps(view: View) {
         if (onPreDrawListener != null) return
         lastDrawTimeMs = 0L
@@ -42,12 +52,7 @@ object FpsMonitor {
                 if (deltaMs in 1..500) {
                     frameTimes.addLast(deltaMs)
                     if (frameTimes.size > 30) frameTimes.removeFirst()
-                    if (frameTimes.isNotEmpty()) {
-                        val avgMs = frameTimes.sum().toFloat() / frameTimes.size
-                        overlayFps = 1000f / avgMs
-                        if (displayRefreshRate == 60f && overlayFps > 80f && frameTimes.size >= 5)
-                            displayRefreshRate = overlayFps
-                    }
+                    overlayFps = 1000f / (frameTimes.sum().toFloat() / frameTimes.size)
                 }
             }
             lastDrawTimeMs = now
@@ -67,66 +72,39 @@ object FpsMonitor {
         overlayFps = 0f
     }
 
-    fun startDrawPacing(view: View) {
-        if (drawPacerActive) return
-        pacerView = WeakReference(view)
-        drawPacer = Executors.newSingleThreadScheduledExecutor()
-        drawPacer?.scheduleAtFixedRate({
-            pacerView?.get()?.postInvalidate()
-        }, 0, 8, TimeUnit.MILLISECONDS)
-        drawPacerActive = true
-    }
-
-    fun stopDrawPacing() {
-        drawPacer?.shutdown()
-        drawPacer = null
-        drawPacerActive = false
-        pacerView = null
-    }
-
-    fun ensureDrawPacing(view: View, currentFps: Float) {
-        if (currentFps in 1.0f..99.9f) {
-            startDrawPacing(view)
-        } else if (currentFps >= 100.0f) {
-            stopDrawPacing()
-        }
-    }
-
     fun updateDisplayRefreshRate(rate: Float) {
         if (rate > 0f) {
             displayRefreshRate = rate
         }
     }
 
-    fun readFps(): FpsResult {
-        val now = SystemClock.uptimeMillis()
-        if (lastDrawTimeMs > 0 && now - lastDrawTimeMs > 1500) {
-            overlayFps = 0f
-        }
-
+    /** Reads FPS for [pkg] (or the current foreground app). See [FpsResult] for value meanings. */
+    fun readFps(pkg: String? = null): FpsResult {
         val maxRate = displayRefreshRate.coerceAtLeast(60f)
 
         if (ShellManager.hasElevatedAccess()) {
-            val pkg = foregroundPackage()
-            if (pkg != null) {
-                try {
-                    val fps = fpsBinder.computeFps(pkg) { cmd ->
-                        ShellManager.exec(cmd).stdout
-                    }
-                    if (fps > 0.0) {
-                        val clampedFps = fps.toFloat().coerceIn(0f, maxRate)
-                        return FpsResult(clampedFps, 0)
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed FpsBinder", e)
-                }
+            val target = pkg ?: foregroundPackage() ?: return NO_DATA
+            return try {
+                val r = fpsBinder.computeFps(target) { cmd -> ShellManager.exec(cmd).stdout }
+                if (r.fps < 0.0) NO_DATA else FpsResult(
+                    fps = r.fps.toFloat().coerceIn(0f, maxRate),
+                    source = if (r.source == "gfxinfo") FpsSource.GFXINFO else FpsSource.SURFACEFLINGER,
+                    presentNs = r.presentNs,
+                    refreshNs = r.refreshNs
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed FpsBinder", e)
+                NO_DATA
             }
         }
-        val clampedOverlayFps = overlayFps.coerceIn(0f, maxRate)
-        return FpsResult(clampedOverlayFps, 0)
+
+        if (lastDrawTimeMs > 0 && SystemClock.uptimeMillis() - lastDrawTimeMs > 1500) overlayFps = 0f
+        val est = overlayFps.coerceIn(0f, maxRate)
+        return if (est > 0f) FpsResult(est, source = FpsSource.FPS_MONITOR) else NO_DATA
     }
 
     private val pkgRegex = Regex("""([a-zA-Z0-9._-]+)/""")
+    private val safePkg = Regex("""[A-Za-z0-9._]+""")
 
     fun foregroundPackage(): String? {
         val result = ShellManager.exec("dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'")
@@ -143,7 +121,8 @@ object FpsMonitor {
                 pkg = match?.groupValues?.get(1)
             }
         }
-        if (pkg.isNullOrBlank() || pkg == "null") return null
+        // pkg is interpolated into shell commands below: only plain package names pass
+        if (pkg.isNullOrBlank() || pkg == "null" || !safePkg.matches(pkg)) return null
 
         val pidResult = ShellManager.exec("pidof '$pkg'")
         val pid = pidResult.stdout.trim().split(Regex("\\s+")).firstOrNull()?.toIntOrNull() ?: run {

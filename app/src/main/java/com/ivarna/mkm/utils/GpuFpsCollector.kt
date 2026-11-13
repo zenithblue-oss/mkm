@@ -4,10 +4,16 @@ import android.os.SystemClock
 import android.util.Log
 import com.ivarna.mkm.data.model.FpsSample
 import com.ivarna.mkm.data.model.FpsSource
+import com.ivarna.mkm.data.model.FrameStats
 import com.ivarna.mkm.shell.ShellManager
-import com.topjohnwu.superuser.Shell
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
@@ -24,6 +30,7 @@ object GpuFpsCollector {
     private const val TRACE_PATH = "/sys/kernel/tracing"
     private const val DMA_EVENT = "dma_fence/dma_fence_signaled"
     private const val SUBMIT_EVENT = "kgsl/adreno_cmdbatch_submitted"
+    private const val KGSL_PATH = "/sys/class/kgsl/kgsl-3d0"
 
     enum class Platform {
         SNAPDRAGON,
@@ -36,8 +43,14 @@ object GpuFpsCollector {
     private var lastPid = 0
     private var cachedCtxIds = ""
 
+    // Serializes every ftrace sequence (probe, sample, cleanup) so a stop→start or a
+    // probe's cleanup can never disable tracing in the middle of another sample.
+    private val ftraceMutex = Mutex()
+    private var lastPresentNs = 0L
+
     private val SNAPDRAGON_PATTERN = Regex(
-        "^(pineapple|kona|lahaina|taro|kalama|msm|sdm|sm[0-9]|cliffs|anorak|pitti)",
+        // Codenames match exactly ("sun" must not catch Allwinner "sun50i..."); SoC ids by prefix.
+        "^(msm|sdm|sm[0-9]|(pineapple|kona|lahaina|taro|kalama|cliffs|anorak|pitti|sun|canoe|parrot|crow|volcano|niobe|holi|blair|bengal|lito|atoll)$)",
         RegexOption.IGNORE_CASE
     )
     private val MEDIATEK_PATTERN = Regex(
@@ -54,6 +67,8 @@ object GpuFpsCollector {
         val detected = when {
             SNAPDRAGON_PATTERN.containsMatchIn(platformStr) -> Platform.SNAPDRAGON
             MEDIATEK_PATTERN.containsMatchIn(platformStr) -> Platform.MEDIATEK
+            // Unlisted codenames: an Adreno KGSL node means Snapdragon
+            java.io.File(KGSL_PATH).exists() || ShellManager.exec("test -e $KGSL_PATH").isSuccess -> Platform.SNAPDRAGON
             else -> Platform.UNKNOWN
         }
         Log.i(TAG, "Detected platform: $detected (prop: $platformStr)")
@@ -69,20 +84,21 @@ object GpuFpsCollector {
     suspend fun probeTracing(): Boolean = withContext(Dispatchers.IO) {
         tracingProbeResult?.let { return@withContext it }
 
-        if (!Shell.getShell().isRoot) {
+        if (!ShellManager.hasRootCapability()) {
             Log.i(TAG, "Root not available; ftrace tracing disabled.")
             tracingProbeResult = false
             return@withContext false
         }
 
-        // Clean up any leftover kernel tracer state before probing
-        shutdown()
-
-        val probeResult = execRoot("echo 0 > $TRACE_PATH/tracing_on 2>/dev/null && echo ok")
-        val isAvailable = probeResult.isSuccess && probeResult.stdout.contains("ok")
-        Log.i(TAG, "ftrace probe result: $isAvailable (exit=${probeResult.exitCode})")
-        tracingProbeResult = isAvailable
-        isAvailable
+        ftraceMutex.withLock {
+            // Clean up leftover kernel tracer state synchronously, under the lock, before probing
+            cleanupLocked()
+            val probeResult = execRoot("echo 0 > $TRACE_PATH/tracing_on 2>/dev/null && echo ok")
+            val isAvailable = probeResult.isSuccess && probeResult.stdout.contains("ok")
+            Log.i(TAG, "ftrace probe result: $isAvailable (exit=${probeResult.exitCode})")
+            tracingProbeResult = isAvailable
+            isAvailable
+        }
     }
 
     /**
@@ -106,36 +122,34 @@ object GpuFpsCollector {
         }
 
         try {
-            when (platform) {
-                Platform.SNAPDRAGON -> sampleSnapdragon(pkg, pid, windowSec)
-                Platform.MEDIATEK -> sampleMediaTek(pkg, pid, windowSec)
-                Platform.UNKNOWN -> sampleFallback(pkg, pid, windowSec)
-            }
+            ftraceMutex.withLock {
+                when (platform) {
+                    Platform.SNAPDRAGON -> sampleSnapdragon(pkg, pid, windowSec)
+                    Platform.MEDIATEK -> sampleMediaTek(pkg, pid, windowSec)
+                    Platform.UNKNOWN -> null
+                }
+            } ?: sampleFallback(pkg, pid, windowSec)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.w(TAG, "Error sampling ftrace on $platform, falling back", e)
             sampleFallback(pkg, pid, windowSec)
         }
     }
 
-    private suspend fun sampleSnapdragon(pkg: String, pid: Int, windowSec: Float): FpsSample {
-        val pfx = pid.toString().take(3)
+    /** Caller holds [ftraceMutex]. Returns null when ftrace cannot attribute frames (caller falls back). */
+    private suspend fun sampleSnapdragon(pkg: String, pid: Int, windowSec: Float): FpsSample? {
         if (pid != lastPid || cachedCtxIds.isBlank()) {
-            cachedCtxIds = discoverSnapdragonCtxs(pfx)
+            cachedCtxIds = discoverSnapdragonCtxs(pid)
             lastPid = pid
         }
-
-        if (cachedCtxIds.isBlank()) {
-            cachedCtxIds = discoverSnapdragonCtxs(pfx)
-            if (cachedCtxIds.isBlank()) {
-                return sampleFallback(pkg, pid, windowSec)
-            }
-        }
+        if (cachedCtxIds.isBlank()) return null
 
         val ctxGrep = cachedCtxIds.trim().split(Regex("\\s+"))
-            .filter { it.isNotBlank() }
+            .filter { it.all(Char::isDigit) && it.isNotEmpty() }
             .joinToString("|") { "ctx=$it[^0-9]" }
 
-        if (ctxGrep.isBlank()) return sampleFallback(pkg, pid, windowSec)
+        if (ctxGrep.isBlank()) return null
 
         val t0: Long
         val tEnd: Long
@@ -205,7 +219,7 @@ object GpuFpsCollector {
         }
     }
 
-    private suspend fun discoverSnapdragonCtxs(pfx: String): String {
+    private suspend fun discoverSnapdragonCtxs(pid: Int): String {
         val result = execRoot(
             "echo 0 > $TRACE_PATH/tracing_on\n" +
             "echo > $TRACE_PATH/trace\n" +
@@ -214,7 +228,7 @@ object GpuFpsCollector {
             "sleep 0.5\n" +
             "echo 0 > $TRACE_PATH/tracing_on\n" +
             "echo 0 > $TRACE_PATH/events/$DMA_EVENT/enable 2>/dev/null\n" +
-            "grep 'driver=kgsl-timeline.*($pfx' $TRACE_PATH/trace 2>/dev/null | " +
+            "grep 'driver=kgsl-timeline.*($pid)' $TRACE_PATH/trace 2>/dev/null | " +
             "grep -o 'kgsl-3d0_[0-9]*' | sed 's/kgsl-3d0_//' | sort -nu | tr '\\n' ' '"
         )
         return result.stdout.trim()
@@ -286,47 +300,59 @@ object GpuFpsCollector {
     private suspend fun sampleFallback(pkg: String, pid: Int, windowSec: Float = 2f): FpsSample {
         // Guarantee proper sampling window cadence for fallback path
         delay((windowSec * 1000).toLong().coerceAtLeast(500L))
-        val fpsResult = FpsMonitor.readFps()
+        val fpsResult = FpsMonitor.readFps(pkg.takeIf { it != "Unknown" })
         val maxRate = FpsMonitor.getDisplayRefreshRate().coerceAtLeast(60f)
         val fps = fpsResult.fps.coerceIn(0f, maxRate)
-        val frameMs = if (fps > 0f) 1000f / fps else 0f
+        // Only frames newer than the previous sample count, so overlapping windows aren't double counted
+        val stats = FrameStats.compute(fpsResult.presentNs, fpsResult.refreshNs, lastPresentNs)
+        fpsResult.presentNs.lastOrNull()?.let { lastPresentNs = maxOf(lastPresentNs, it) }
         return FpsSample(
             tMs = System.currentTimeMillis(),
             fps = fps,
-            frameMs = frameMs,
+            frameMs = stats?.avgFrameMs ?: if (fps > 0f) 1000f / fps else 0f,
             pkg = pkg,
             pid = pid,
-            source = FpsSource.FPS_MONITOR,
-            events = 0,
-            idle = fps <= 0f
+            source = fpsResult.source ?: FpsSource.FPS_MONITOR,
+            events = stats?.frameTimesMs?.size ?: 0,
+            // fps < 0 = no data: recorded as idle rather than as a fake number
+            idle = fps <= 0f,
+            low1Fps = stats?.low1Fps ?: 0f,
+            low01Fps = stats?.low01Fps ?: 0f,
+            maxFrameMs = stats?.maxFrameMs ?: 0f,
+            jankCount = stats?.jankCount ?: 0,
+            stutterPct = stats?.stutterPct ?: 0f,
+            frameTimesMs = stats?.frameTimesMs
         )
     }
 
-    /**
-     * Stops tracing and disables ftrace events. Idempotent and safe.
-     */
-    fun shutdown() {
-        if (Shell.getShell().isRoot) {
-            try {
-                Shell.cmd(
-                    "echo 0 > $TRACE_PATH/tracing_on 2>/dev/null || true",
-                    "echo 0 > $TRACE_PATH/events/$DMA_EVENT/enable 2>/dev/null || true",
-                    "echo 0 > $TRACE_PATH/events/$SUBMIT_EVENT/enable 2>/dev/null || true"
-                ).exec()
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to shutdown ftrace", e)
-            }
-        }
+    /** Stops tracing and disables ftrace events. Idempotent; waits for any in-flight sample. */
+    suspend fun shutdown() = withContext(Dispatchers.IO + NonCancellable) {
+        ftraceMutex.withLock { cleanupLocked() }
+    }
+
+    /** Fire-and-forget [shutdown] for callers that cannot suspend (Service.onDestroy). Still serialized. */
+    fun shutdownAsync() {
+        CoroutineScope(Dispatchers.IO).launch { shutdown() }
+    }
+
+    private fun cleanupLocked() {
+        if (!ShellManager.hasRootCapability()) return
+        execRoot(
+            "echo 0 > $TRACE_PATH/tracing_on 2>/dev/null || true; " +
+                "echo 0 > $TRACE_PATH/events/$DMA_EVENT/enable 2>/dev/null || true; " +
+                "echo 0 > $TRACE_PATH/events/$SUBMIT_EVENT/enable 2>/dev/null || true"
+        )
+    }
+
+    /** New recording session: forget the previous session's last frame. */
+    fun resetFrameCursor() {
+        lastPresentNs = 0L
     }
 
     private fun execRoot(command: String): ShellManager.CommandResult {
         return try {
-            val result = Shell.cmd(command).exec()
-            ShellManager.CommandResult(
-                result.code,
-                result.out.joinToString("\n").trim(),
-                result.err.joinToString("\n").trim()
-            )
+            // libsu root when present, otherwise Shizuku running as uid 0
+            ShellManager.exec(command, ShellManager.PrivilegeRequirement.ELEVATED_SYSFS)
         } catch (e: Exception) {
             ShellManager.CommandResult(-1, "", e.message ?: "Root execution error")
         }

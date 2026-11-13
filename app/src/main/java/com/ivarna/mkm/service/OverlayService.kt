@@ -4,11 +4,20 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.PixelFormat
+import android.net.TrafficStats
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
+import android.os.SystemClock
+import androidx.core.content.ContextCompat
+import com.ivarna.mkm.shell.ShellManager
+import kotlinx.coroutines.flow.first
+import com.ivarna.mkm.utils.StatusIconRenderer
 import android.util.Log
 import android.view.Gravity
 import android.view.WindowManager
@@ -34,6 +43,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.foundation.Canvas
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -93,7 +103,7 @@ class OverlayService : Service() {
     private var absRamState by mutableStateOf(true)
     private var absSwapState by mutableStateOf(true)
     private var showFpsState by mutableStateOf(false)
-    private val _fpsState = MutableStateFlow(FpsMonitor.FpsResult(0f, 0))
+    private val _fpsState = MutableStateFlow(FpsMonitor.FpsResult(-1f))
     private val fpsState = _fpsState.asStateFlow()
     private var recordingJob: Job? = null
 
@@ -102,6 +112,7 @@ class OverlayService : Service() {
     private val MAX_HISTORY = 15
 
     private val CHANNEL_ID = "overlay_service"
+    private val STATUS_ICON_CHANNEL_ID = "overlay_status_icon"
     private val NOTIFICATION_ID = 1001
 
     companion object {
@@ -111,10 +122,85 @@ class OverlayService : Service() {
         const val MIN_UPDATE_INTERVAL_MS = 500L
         const val MAX_UPDATE_INTERVAL_MS = 5000L
 
+        /** Comma-separated metric keys (max 2, shown stacked in one icon); "off" or empty = no icon. */
+        const val KEY_STATUS_ICON_METRIC = "status_icon_metric"
+        const val MAX_STATUS_ICON_METRICS = 2
+
         @Volatile
         var isRunning: Boolean = false
             private set
+
+        internal fun nextDelayMs(intervalMs: Long, elapsedMs: Long): Long =
+            (intervalMs.coerceAtLeast(MIN_UPDATE_INTERVAL_MS) - elapsedMs).coerceAtLeast(0L)
+
+        /** Parses the status icon pref; a legacy single value ("power") stays valid. */
+        internal fun parseStatusIconMetrics(pref: String?): List<String> =
+            pref.orEmpty().split(',').map { it.trim() }.filter { it.isNotEmpty() && it != "off" }
+                .distinct().take(MAX_STATUS_ICON_METRICS)
+
+        /** Short text for one status bar icon metric, or null for an unknown key. */
+        internal fun statusIconText(metric: String, h: HomeData, netRxBps: Long = -1L): String? = when (metric) {
+            "power" -> String.format("%.1f", kotlin.math.abs(h.power.calibratedPowerW))
+            "battery_temp" -> String.format("%.0f", h.batteryTemp)
+            "cpu_temp" -> String.format("%.0f", h.cpuTemp)
+            "battery_percent" -> h.power.batteryPercent.toString()
+            "net_speed" -> formatRate(netRxBps)
+            else -> null
+        }
+
+        /** Bytes/s from two TrafficStats readings; -1 = unsupported, 0 on counter reset. */
+        internal fun netRateBps(prevBytes: Long, curBytes: Long, elapsedMs: Long): Long = when {
+            prevBytes < 0L || curBytes < 0L -> -1L
+            elapsedMs <= 0L || curBytes < prevBytes -> 0L
+            else -> (curBytes - prevBytes) * 1000L / elapsedMs
+        }
+
+        internal fun formatRate(bps: Long): String = when {
+            bps < 0L -> "N/A"
+            bps >= 1024L * 1024L -> String.format(java.util.Locale.US, "%.1fM", bps / (1024.0 * 1024.0))
+            else -> "${bps / 1024L}K"
+        }
     }
+
+    private var statusIconMetricsState = emptyList<String>()
+    private var lastStatusIconText: List<String>? = null
+
+    private fun updateStatusIcon(h: HomeData) {
+        val texts = statusIconMetricsState.mapNotNull { statusIconText(it, h, netRxBpsState) }
+        if (texts == lastStatusIconText) return
+        lastStatusIconText = texts
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, createNotification(texts))
+    }
+
+    // Net speed (bytes/s); -1 until two readings exist or when TrafficStats is unsupported
+    private var netRxBpsState by mutableStateOf(-1L)
+    private var netTxBpsState by mutableStateOf(-1L)
+    private var prevRxBytes = -1L
+    private var prevTxBytes = -1L
+    private var prevNetTimeMs = 0L
+    private var showNetSpeedState by mutableStateOf(false)
+
+    private fun updateNetSpeed() {
+        val now = SystemClock.elapsedRealtime()
+        val rx = TrafficStats.getTotalRxBytes()
+        val tx = TrafficStats.getTotalTxBytes()
+        if (prevNetTimeMs > 0L) {
+            netRxBpsState = netRateBps(prevRxBytes, rx, now - prevNetTimeMs)
+            netTxBpsState = netRateBps(prevTxBytes, tx, now - prevNetTimeMs)
+        }
+        prevRxBytes = rx
+        prevTxBytes = tx
+        prevNetTimeMs = now
+    }
+
+    // Polling stops while the screen is off and resumes on SCREEN_ON
+    private val interactive = MutableStateFlow(true)
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            interactive.value = intent.action != Intent.ACTION_SCREEN_OFF
+        }
+    }
+    private var overlayAdded = false
 
     override fun onCreate() {
         super.onCreate()
@@ -149,6 +235,16 @@ class OverlayService : Service() {
             startForeground(NOTIFICATION_ID, createNotification())
         }
         isRunning = true
+        interactive.value = getSystemService(PowerManager::class.java)?.isInteractive ?: true
+        ContextCompat.registerReceiver(
+            this,
+            screenReceiver,
+            IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_SCREEN_OFF)
+            },
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
         showOverlay()
         startMonitoring()
         observeFpsRecording()
@@ -179,7 +275,7 @@ class OverlayService : Service() {
         isGridViewState = prefs.getBoolean("is_grid_view", false)
         gridColumnsState = prefs.getInt("grid_columns", 2)
         isHorizontalState = prefs.getBoolean("is_horizontal", false)
-        val defaultOrder = "cpu_usage,cpu_freq,gpu_usage,ram_usage,swap_usage,power_usage,cpu_temp,battery_temp,battery_percent,fps"
+        val defaultOrder = "cpu_usage,cpu_freq,gpu_usage,ram_usage,swap_usage,power_usage,cpu_temp,battery_temp,battery_percent,fps,net_speed"
         val savedOrder = (prefs.getString("component_order", defaultOrder) ?: defaultOrder).split(",")
         // Ensure any newly added default items (e.g. "fps") are included
         val defaultItems = defaultOrder.split(",")
@@ -199,25 +295,25 @@ class OverlayService : Service() {
         absRamState = prefs.getBoolean("abs_ram", true)
         absSwapState = prefs.getBoolean("abs_swap", true)
         showFpsState = prefs.getBoolean("show_fps", false)
+        showNetSpeedState = prefs.getBoolean("show_net_speed", false)
+        statusIconMetricsState = parseStatusIconMetrics(prefs.getString(KEY_STATUS_ICON_METRIC, "off"))
     }
 
     private fun updateSettings() {
         loadSettings()
-        if (!::composeView.isInitialized || !composeView.isAttachedToWindow) return
-        
+        if (!overlayAdded || !composeView.isAttachedToWindow) return
+
         val flags = if (isMovableState) {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
         } else {
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or 
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
             // Avoid status bar overlap by removing FLAG_LAYOUT_IN_SCREEN
         }
 
+        // preferredRefreshRate stays 0: pinning max Hz for the overlay would force the whole panel there
         val params = (composeView.layoutParams as WindowManager.LayoutParams).apply {
             this.flags = flags
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                preferredRefreshRate = if (showFpsState) getPreferredRefreshRate() else 0f
-            }
             if (isMovableState) {
                 // If switching back to movable from a fixed position, reset to a default point
                 if (x == 0 && (gravity == (Gravity.TOP or Gravity.CENTER_HORIZONTAL) || 
@@ -256,27 +352,53 @@ class OverlayService : Service() {
             )
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
+            // Android hides status bar icons of low-importance (silent) notifications, so the
+            // optional status icon uses its own default-importance channel with no sound/vibration.
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    STATUS_ICON_CHANNEL_ID,
+                    "Overlay Status Icon",
+                    NotificationManager.IMPORTANCE_DEFAULT
+                ).apply {
+                    setSound(null, null)
+                    enableVibration(false)
+                    setShowBadge(false)
+                }
+            )
         }
     }
 
-    private fun createNotification(): Notification {
+    private fun createNotification(iconTexts: List<String> = emptyList()): Notification {
+        val showIcon = iconTexts.isNotEmpty()
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, CHANNEL_ID)
+            Notification.Builder(this, if (showIcon) STATUS_ICON_CHANNEL_ID else CHANNEL_ID)
         } else {
             Notification.Builder(this)
         }
 
-        return builder
+        builder
             .setContentTitle("MKM Overlay Active")
             .setContentText("Status monitor is running")
-            .setSmallIcon(R.drawable.ic_stat_battery)
-            .build()
+            .setOnlyAlertOnce(true)
+        if (showIcon) {
+            builder.setSmallIcon(android.graphics.drawable.Icon.createWithBitmap(StatusIconRenderer.render(iconTexts)))
+        } else {
+            builder.setSmallIcon(R.drawable.ic_stat_battery)
+        }
+        return builder.build()
     }
 
     private fun startMonitoring() {
         val calibrationManager = PowerCalibrationManager(this)
         serviceScope.launch {
+            // One sequential loop: a slow tick delays the next one instead of stacking
             while (isActive) {
+                if (!interactive.value) {
+                    interactive.first { it }
+                    prevNetTimeMs = 0L // don't average net speed across the screen-off gap
+                }
+                val tickStart = SystemClock.elapsedRealtime()
+                if (showNetSpeedState || "net_speed" in statusIconMetricsState) updateNetSpeed()
                 val data = repository.getHomeData(calibrationManager.getMultiplier())
                 uiState.value = data
                 
@@ -301,23 +423,24 @@ class OverlayService : Service() {
                 if (showFpsState) {
                     val maxRate = getActiveRefreshRate().coerceAtLeast(60f)
                     FpsMonitor.updateDisplayRefreshRate(maxRate)
-                    if (::composeView.isInitialized && composeView.isAttachedToWindow) {
+                    // The passive overlay-redraw estimate is only a fallback when no elevated source exists
+                    val elevated = withContext(Dispatchers.IO) { ShellManager.hasElevatedAccess() } // libsu may block
+                    if (!elevated && overlayAdded) {
                         FpsMonitor.initOverlayFps(composeView)
+                    } else {
+                        FpsMonitor.stopOverlayFps()
                     }
                     val fpsResult = withContext(Dispatchers.IO) { FpsMonitor.readFps() }
-                    val clampedResult = fpsResult.copy(fps = fpsResult.fps.coerceIn(0f, maxRate))
-                    _fpsState.value = clampedResult
-                    updateHistory("fps", (clampedResult.fps / maxRate).coerceIn(0f, 1f))
-                    if (::composeView.isInitialized && composeView.isAttachedToWindow) {
-                        FpsMonitor.ensureDrawPacing(composeView, clampedResult.fps)
-                    }
+                    _fpsState.value = fpsResult
+                    updateHistory("fps", (fpsResult.fps / maxRate).coerceIn(0f, 1f))
                 } else {
                     FpsMonitor.stopOverlayFps()
-                    FpsMonitor.stopDrawPacing()
                 }
                 
-                val interval = updateIntervalState.coerceAtLeast(MIN_UPDATE_INTERVAL_MS)
-                delay(interval)
+                data?.let { updateStatusIcon(it) }
+
+                // Interval is the loop period, not idle time after the work
+                delay(nextDelayMs(updateIntervalState, SystemClock.elapsedRealtime() - tickStart))
             }
         }
     }
@@ -349,9 +472,6 @@ class OverlayService : Service() {
             flags,
             PixelFormat.TRANSLUCENT
         ).apply {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                preferredRefreshRate = if (showFpsState) getPreferredRefreshRate() else 0f
-            }
             if (isMovableState) {
                 gravity = Gravity.TOP or Gravity.START
                 x = 100
@@ -503,13 +623,25 @@ class OverlayService : Service() {
                             }
                             metricsMap["fps"] = {
                                 if (showFpsState) {
-                                    val currentFps by fpsState.collectAsState()
-                val maxRate = getActiveRefreshRate().coerceAtLeast(60f)
-                val clampedFps = currentFps.fps.coerceIn(0f, maxRate)
-                val fpsDisplay = if (clampedFps > 0f) String.format("%.0f", clampedFps) else "0"
-                val progress = (clampedFps / maxRate).coerceIn(0f, 1f)
-                CompactMetric("FPS", fpsDisplay, progress, true, Icons.Default.SlowMotionVideo, showIconsOnlyState, metricHistory["fps"])
+                                                    val currentFps by fpsState.collectAsState()
+                                    val maxRate = getActiveRefreshRate().coerceAtLeast(60f)
+                                    val clampedFps = currentFps.fps.coerceIn(0f, maxRate)
+                                    // -1 = no data ("N/A"); 0 = app idle. Badge names the source (SF/gfx/ftrace/est.).
+                                    val badge = when (currentFps.source) {
+                                        FpsSource.SURFACEFLINGER -> stringResource(R.string.fps_badge_sf)
+                                        FpsSource.GFXINFO -> stringResource(R.string.fps_badge_gfx)
+                                        FpsSource.ADRENO_INFLIGHT, FpsSource.MALI_DMA_FENCE -> stringResource(R.string.fps_badge_ftrace)
+                                        FpsSource.FPS_MONITOR -> stringResource(R.string.fps_badge_est)
+                                        null -> null
+                                    }
+                                    val fpsDisplay = if (currentFps.fps < 0f) "N/A"
+                                        else String.format("%.0f", clampedFps) + (badge?.let { " $it" } ?: "")
+                                    val progress = (clampedFps / maxRate).coerceIn(0f, 1f)
+                                    CompactMetric("FPS", fpsDisplay, progress, true, Icons.Default.SlowMotionVideo, showIconsOnlyState, metricHistory["fps"])
                                 }
+                            }
+                            if (showNetSpeedState) metricsMap["net_speed"] = {
+                                CompactMetric("NET", "↓${formatRate(netRxBpsState)} ↑${formatRate(netTxBpsState)}", 0f, false, Icons.Default.NetworkCheck, showIconsOnlyState, null)
                             }
 
                             val metrics = componentOrderState.mapNotNull { metricsMap[it] }
@@ -552,7 +684,21 @@ class OverlayService : Service() {
             }
         }
 
-        windowManager.addView(composeView, params)
+        try {
+            windowManager.addView(composeView, params)
+            overlayAdded = true
+        } catch (e: WindowManager.BadTokenException) {
+            failOverlay(e)
+        } catch (e: SecurityException) {
+            failOverlay(e)
+        }
+    }
+
+    /** Overlay permission revoked or window token invalid: stop instead of crashing, and reflect it in prefs. */
+    private fun failOverlay(e: Exception) {
+        Log.e("OverlayService", "Cannot add overlay window", e)
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().putBoolean("enabled", false).apply()
+        stopSelf()
     }
 
     @OptIn(ExperimentalMaterial3ExpressiveApi::class)
@@ -684,8 +830,12 @@ class OverlayService : Service() {
     }
 
     private fun startFpsRecording() {
-        recordingJob?.cancel()
+        val previous = recordingJob
+        previous?.cancel()
         recordingJob = serviceScope.launch(Dispatchers.IO) {
+            // stop→start: wait until the previous job's ftrace cleanup has finished
+            previous?.join()
+            GpuFpsCollector.resetFrameCursor()
             try {
                 val maxRate = getActiveRefreshRate().coerceAtLeast(60f)
                 FpsMonitor.updateDisplayRefreshRate(maxRate)
@@ -693,6 +843,7 @@ class OverlayService : Service() {
                 FpsSessionRecorder.setPlatform(platform.name)
                 var consecutiveFtraceFailures = 0
                 while (isActive && FpsSessionRecorder.isRecording.value) {
+                    interactive.first { it }
                     val currentMaxRate = getActiveRefreshRate().coerceAtLeast(60f)
                     FpsMonitor.updateDisplayRefreshRate(currentMaxRate)
                     val fallbackOnly = consecutiveFtraceFailures >= 2
@@ -704,31 +855,45 @@ class OverlayService : Service() {
                         } else {
                             sample
                         }
-                        if (clampedSample.source == FpsSource.FPS_MONITOR && GpuFpsCollector.probeTracing() && !fallbackOnly) {
+                        val isFtrace = clampedSample.source == FpsSource.ADRENO_INFLIGHT ||
+                            clampedSample.source == FpsSource.MALI_DMA_FENCE
+                        if (!isFtrace && GpuFpsCollector.probeTracing() && !fallbackOnly) {
                             consecutiveFtraceFailures++
-                        } else if (clampedSample.source != FpsSource.FPS_MONITOR) {
+                        } else if (isFtrace) {
                             consecutiveFtraceFailures = 0
                         }
-                        FpsSessionRecorder.add(clampedSample)
+                        FpsSessionRecorder.add(withDeviceMetrics(clampedSample), ignorePkg = packageName)
                     }
                 }
             } finally {
+                // Synchronous (NonCancellable) and serialized with any other ftrace user
                 GpuFpsCollector.shutdown()
             }
         }
     }
 
+    private fun withDeviceMetrics(sample: com.ivarna.mkm.data.model.FpsSample) = uiState.value?.let { h ->
+        val watts = kotlin.math.abs(h.power.calibratedPowerW)
+        sample.copy(
+            gpuFreqMhz = parseFreqMHz(h.gpu.currentFreq),
+            gpuLoadPct = h.gpu.loadPercent * 100f,
+            cpuTemp = h.cpuTemp,
+            batteryTemp = h.batteryTemp,
+            powerW = if (h.power.isCharging) watts else -watts
+        )
+    } ?: sample
+
     private fun stopFpsRecording() {
+        // The job's finally block performs the ftrace cleanup; startFpsRecording joins it
         recordingJob?.cancel()
-        recordingJob = null
-        GpuFpsCollector.shutdown()
     }
 
     override fun onDestroy() {
-        GpuFpsCollector.shutdown()
+        recordingJob?.cancel()
+        GpuFpsCollector.shutdownAsync()
         FpsSessionRecorder.stop()
         FpsMonitor.stopOverlayFps()
-        FpsMonitor.stopDrawPacing()
+        try { unregisterReceiver(screenReceiver) } catch (_: IllegalArgumentException) { }
         if (::lifecycleOwner.isInitialized) {
             (lifecycleOwner.lifecycle as LifecycleRegistry).currentState = Lifecycle.State.DESTROYED
         }
@@ -739,27 +904,14 @@ class OverlayService : Service() {
         if (::viewModelStore.isInitialized) {
             viewModelStore.clear()
         }
-        if (::composeView.isInitialized && composeView.isAttachedToWindow) {
-            windowManager.removeView(composeView)
+        if (overlayAdded) {
+            try { windowManager.removeView(composeView) } catch (e: IllegalArgumentException) {
+                Log.w("OverlayService", "Overlay view already detached", e)
+            }
+            overlayAdded = false
         }
         isRunning = false
         super.onDestroy()
-    }
-
-    private fun getPreferredRefreshRate(): Float {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            try {
-                val displayManager = getSystemService(Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager
-                val defaultDisplay = displayManager.getDisplay(android.view.Display.DEFAULT_DISPLAY)
-                val maxFps = defaultDisplay?.supportedModes?.map { it.refreshRate }?.maxOrNull()
-                if (maxFps != null && maxFps > 60f) {
-                    return maxFps
-                }
-            } catch (e: Exception) {
-                Log.w("OverlayService", "Failed to query supported refresh rates", e)
-            }
-        }
-        return 0f
     }
 
     private fun getActiveRefreshRate(): Float {

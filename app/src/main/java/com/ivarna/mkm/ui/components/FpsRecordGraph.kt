@@ -30,21 +30,24 @@ fun FpsRecordGraph(
     isRecording: Boolean,
     modifier: Modifier = Modifier
 ) {
+    // The series may be downsampled on long sessions; summary numbers come from the exact aggregate
     val allSamples = session.samples
-    val activeSamples = allSamples.filter { !it.idle && it.fps > 0f }
+    val stats = session.stats
 
     val currentSample = allSamples.lastOrNull()
     val currentFps = if (currentSample != null && !currentSample.idle) currentSample.fps else 0f
-    val avgFps = if (activeSamples.isNotEmpty()) activeSamples.map { it.fps }.average().toFloat() else 0f
-    val minFps = if (activeSamples.isNotEmpty()) activeSamples.minOf { it.fps } else 0f
-    val maxFps = if (activeSamples.isNotEmpty()) activeSamples.maxOf { it.fps } else 0f
+    val avgFps = stats.avgFps
+    val minFps = stats.minFps
+    val maxFps = stats.maxFps
 
-    val latestPkg = currentSample?.pkg ?: "—"
+    val latestPkg = session.targetPkg ?: currentSample?.pkg ?: "—"
     val latestPid = currentSample?.pid ?: 0
     val latestSource = when (currentSample?.source) {
         FpsSource.ADRENO_INFLIGHT -> stringResource(R.string.fps_source_adreno)
         FpsSource.MALI_DMA_FENCE -> stringResource(R.string.fps_source_mali)
-        FpsSource.FPS_MONITOR -> stringResource(R.string.fps_source_monitor)
+        FpsSource.SURFACEFLINGER -> stringResource(R.string.fps_source_sf)
+        FpsSource.GFXINFO -> stringResource(R.string.fps_source_gfxinfo)
+        FpsSource.FPS_MONITOR -> stringResource(R.string.fps_source_estimate)
         null -> "—"
     }
 
@@ -154,10 +157,43 @@ fun FpsRecordGraph(
                 )
                 MetricPill(
                     label = stringResource(R.string.samples_count),
-                    value = "${activeSamples.size}/${allSamples.size}",
+                    value = "${stats.activeCount}/${stats.sampleCount}",
                     unit = "",
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+            }
+
+            // Frame-time stats (only when the source exposes per-frame timestamps)
+            if (stats.frameCount > 0L) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    MetricPill(
+                        label = stringResource(R.string.fps_low_1),
+                        value = String.format("%.1f", stats.low1Fps),
+                        unit = "FPS",
+                        color = MaterialTheme.colorScheme.tertiary
+                    )
+                    MetricPill(
+                        label = stringResource(R.string.fps_low_01),
+                        value = String.format("%.1f", stats.low01Fps),
+                        unit = "FPS",
+                        color = MaterialTheme.colorScheme.error
+                    )
+                    MetricPill(
+                        label = stringResource(R.string.fps_jank),
+                        value = stats.jankCount.toString(),
+                        unit = "",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    MetricPill(
+                        label = stringResource(R.string.fps_stutter),
+                        value = String.format("%.1f", stats.stutterPct),
+                        unit = "%",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
 
             // FPS Graph Canvas
@@ -237,25 +273,76 @@ fun FpsRecordGraph(
             }
 
             if (allSamples.size >= 2) {
-                val elapsedSec = ((allSamples.last().tMs - allSamples.first().tMs) / 1000f).coerceAtLeast(0f)
+                // Axis labels are offsets from the session start, not from the first plotted point
+                val startSec = ((allSamples.first().tMs - session.startedAtMs) / 1000f).coerceAtLeast(0f)
+                val endSec = ((allSamples.last().tMs - session.startedAtMs) / 1000f).coerceAtLeast(startSec)
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = "0s",
+                        text = formatElapsed(startSec),
                         style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
                         color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
                     )
                     Text(
-                        text = String.format("%.0fs", elapsedSec),
+                        text = formatElapsed(endSec),
                         style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
                         color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
                     )
                 }
             }
+
+            // Frame-time graph: average (line) and worst (dots) frame per sample
+            val frameSamples = allSamples.filter { !it.idle && it.frameMs > 0f }
+            if (frameSamples.size >= 2) {
+                Text(
+                    text = stringResource(R.string.fps_frame_time_ms),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                val ftColor = MaterialTheme.colorScheme.tertiary
+                val worstColor = MaterialTheme.colorScheme.error
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(100.dp)
+                        .background(
+                            MaterialTheme.colorScheme.surface.copy(alpha = 0.5f),
+                            RoundedCornerShape(8.dp)
+                        )
+                        .padding(8.dp)
+                ) {
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        val maxMs = maxOf(frameSamples.maxOf { maxOf(it.frameMs, it.maxFrameMs) } * 1.1f, 20f)
+                        val stepX = size.width / (frameSamples.size - 1)
+                        fun yOf(ms: Float) = (size.height - ms / maxMs * size.height).coerceIn(0f, size.height)
+                        listOf(1000f / 60f, 1000f / 30f).filter { it < maxMs }.forEach { ms ->
+                            drawLine(
+                                color = gridColor,
+                                start = Offset(0f, yOf(ms)),
+                                end = Offset(size.width, yOf(ms)),
+                                strokeWidth = 1.dp.toPx(),
+                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 6f))
+                            )
+                        }
+                        val path = Path()
+                        frameSamples.forEachIndexed { i, s ->
+                            val x = i * stepX
+                            if (i == 0) path.moveTo(x, yOf(s.frameMs)) else path.lineTo(x, yOf(s.frameMs))
+                            if (s.maxFrameMs > 0f) drawCircle(worstColor, 2.dp.toPx(), Offset(x, yOf(s.maxFrameMs)))
+                        }
+                        drawPath(path, ftColor, style = Stroke(width = 2.dp.toPx()))
+                    }
+                }
+            }
         }
     }
+}
+
+private fun formatElapsed(sec: Float): String {
+    val s = sec.toInt()
+    return if (s >= 60) String.format("%d:%02d", s / 60, s % 60) else "${s}s"
 }
 
 @Composable

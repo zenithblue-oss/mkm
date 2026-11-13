@@ -4,8 +4,9 @@
 // v2.1 changes:
 //  - Fixed FPS math: removed overly restrictive count>=15 guard; any window
 //    ≥200ms now computes proper (N-1)/Δt instead of raw count.
-//  - Added --latency-frameinfo fallback (Android 12+): 7-field format parser
-//    + new JNI entry, inserted between --latency and gfxinfo in the chain.
+//  - (v2.2) Removed the --latency-frameinfo fallback: not a SurfaceFlinger
+//    flag, so it only triggered a full dump. Pending-fence rows (INT64_MAX)
+//    are skipped; BLAST SurfaceView layers are matched and ranked first.
 //
 // WHY v2 EXISTS — v1 was stuck reporting the same FPS. Research
 // against AOSP source + the smart-test-ti/SoloX tracker + alibaba/mobileperf
@@ -96,6 +97,7 @@
 #include <cctype>
 #include <cstring>
 #include <cerrno>
+#include <cstdint>
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -237,7 +239,11 @@ static std::string sfDump(const std::vector<std::string>& args) {
     if (!viaBinder.empty()) return viaBinder;
 
     std::string cmd = "dumpsys SurfaceFlinger";
-    for (const auto& a : args) cmd += " '" + a + "'";
+    for (const auto& a : args) {
+        // Args are single-quoted below; a quote would break out of it (layer titles are app-controlled).
+        if (a.find('\'') != std::string::npos) return "";
+        cmd += " '" + a + "'";
+    }
     cmd += " 2>/dev/null";
 
     std::string viaShell = runShell(cmd);
@@ -271,10 +277,14 @@ static std::string gfxInfoDump(const std::string& packageName) {
 static std::vector<std::string> findLayerCandidatesForPackage(
         const std::string& listDump, const std::string& packageName) {
 
+    std::vector<std::string> blastHits;
     std::vector<std::string> surfaceViewHits;
     std::vector<std::string> plainHits;
 
-    static const std::regex svRegex(R"(SurfaceView\[[^\]]*\]#\d+)");
+    // Android 12+ BLAST adapters name the producer layer `SurfaceView[pkg/act](BLAST)#N`;
+    // that one carries the app's frames, so it ranks first. Quotes are excluded so a
+    // window title can never escape the shell quoting used by the dumpsys fallback.
+    static const std::regex svRegex(R"(SurfaceView\[[^\]'"]*\](\(BLAST\))?#\d+)");
     static const std::regex plainRegex(R"([A-Za-z0-9_.]+/[A-Za-z0-9_.$]+#\d+)");
 
     std::istringstream stream(listDump);
@@ -291,7 +301,9 @@ static std::vector<std::string> findLayerCandidatesForPackage(
         std::smatch m;
         if (std::regex_search(line, m, svRegex)) {
             std::string hit = m.str();
-            if (seen.insert(hit).second && !isDecoration) surfaceViewHits.push_back(hit);
+            if (seen.insert(hit).second && !isDecoration) {
+                (m[1].matched ? blastHits : surfaceViewHits).push_back(hit);
+            }
         } else if (std::regex_search(line, m, plainRegex)) {
             std::string hit = m.str();
             if (seen.insert(hit).second && !isDecoration) plainHits.push_back(hit);
@@ -299,6 +311,7 @@ static std::vector<std::string> findLayerCandidatesForPackage(
     }
 
     std::vector<std::string> ranked;
+    ranked.insert(ranked.end(), blastHits.begin(), blastHits.end());
     ranked.insert(ranked.end(), surfaceViewHits.begin(), surfaceViewHits.end());
     ranked.insert(ranked.end(), plainHits.begin(), plainHits.end());
     return ranked;
@@ -331,7 +344,9 @@ static std::vector<FrameTimestamps> parseLatency(const std::string& dump) {
         std::istringstream ls(line);
         int64_t a = 0, b = 0, c = 0;
         if (!(ls >> a >> b >> c)) continue;
-        if (a == 0 && b == 0 && c == 0) continue;
+        // b is the present time; INT64_MAX marks a frame whose present fence is still
+        // pending, and 0 an empty slot. Neither is a presented frame.
+        if (b <= 0 || b == INT64_MAX) continue;
         frames.push_back({a, b, c});
     }
 
@@ -346,60 +361,6 @@ static std::vector<FrameTimestamps> parseLatency(const std::string& dump) {
 
 static std::vector<FrameTimestamps> getLayerFrameTimestamps(const std::string& layerName) {
     return parseLatency(sfDump({"--latency", layerName}));
-}
-
-// ---------------------------------------------------------------------------
-// SECTION: `--latency-frameinfo <layer>` parsing (Android 12+)
-//
-// 7-field format (one frame per line):
-//   frameNum vsyncId inputEventTime animationStartTime
-//   gpuCompositionStartTime gpuCompositionEndTime presentTime
-//
-// All values are int64 timestamps in nanoseconds.
-// presentTime is the column we trust for FPS math — it's when the frame
-// actually hit the display. On devices where --latency returns no rows
-// (SoloX#303 / Android 15/16 regression), --latency-frameinfo may still
-// work because it queries a different dump path inside SurfaceFlinger.
-// ---------------------------------------------------------------------------
-
-static std::vector<FrameTimestamps> parseLatencyFrameinfo(const std::string& dump) {
-    std::vector<FrameTimestamps> frames;
-    if (dump.empty()) return frames;
-
-    std::istringstream stream(dump);
-    std::string line;
-    size_t totalLines = 0;
-
-    while (std::getline(stream, line)) {
-        if (line.empty()) continue;
-        if (!std::isdigit(line[0])) continue;
-        totalLines++;
-
-        std::istringstream ls(line);
-        int64_t frameNum = 0, vsyncId = 0, inputTime = 0, animStart = 0;
-        int64_t gpuStart = 0, gpuEnd = 0, presentTime = 0;
-
-        if (ls >> frameNum >> vsyncId >> inputTime >> animStart
-              >> gpuStart >> gpuEnd >> presentTime) {
-            if (presentTime > 0) {
-                frames.push_back({animStart, presentTime, gpuEnd});
-            }
-        }
-    }
-
-    // Degenerate output detection: same as --latency — if we barely got
-    // any real rows, treat as unavailable rather than trusting it.
-    if (totalLines > 0 && frames.size() < kMinRealRows) {
-        LOGD("--latency-frameinfo had %zu header/text lines but only %zu real "
-             "frame rows — treating as unavailable", totalLines, frames.size());
-        return {};
-    }
-
-    return frames;
-}
-
-static std::vector<FrameTimestamps> getLayerFrameInfo(const std::string& layerName) {
-    return parseLatencyFrameinfo(sfDump({"--latency-frameinfo", layerName}));
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +516,15 @@ static double computeFpsFromLatencyFrames(const std::vector<FrameTimestamps>& fr
     return fpsFromSortedTimestampsNanos(times);
 }
 
+// -1 = no frame data at all; 0 = data present but the app is idle.
+static double gfxinfoFps(const std::vector<std::vector<int64_t>>& blocks) {
+    double maxFps = -1.0;
+    for (const auto& completions : blocks) {
+        if (completions.size() >= 2) maxFps = std::max(maxFps, fpsFromSortedTimestampsNanos(completions));
+    }
+    return maxFps;
+}
+
 // ---------------------------------------------------------------------------
 // SECTION: combined strategy — SurfaceFlinger latency if it yields real
 // data, gfxinfo framestats otherwise. Only returns -1.0 if BOTH genuinely
@@ -568,41 +538,25 @@ static double getBestFpsForPackage(const std::string& packageName, FpsSource* ou
              "this process (see privilege-boundary note at top of file)");
     } else {
         // Strategy 1: SurfaceFlinger --latency (best for SurfaceView/GPU apps)
+        // (`--latency-frameinfo` was dropped: SurfaceFlinger has no such flag and
+        // unknown args fall through to a full, expensive dump.)
         auto candidates = findLayerCandidatesForPackage(listDump, packageName);
+        double best = -1.0;
         for (const auto& candidate : candidates) {
             auto frames = getLayerFrameTimestamps(candidate);
             if (frames.empty()) continue;
-            double fps = computeFpsFromLatencyFrames(frames);
-            if (fps > 0.0) {
-                if (outSource) *outSource = FpsSource::SURFACEFLINGER_LATENCY;
-                LOGD("FPS via SurfaceFlinger --latency \"%s\": %.2f", candidate.c_str(), fps);
-                return fps;
-            }
+            best = std::max(best, computeFpsFromLatencyFrames(frames)); // 0 = valid idle
+            if (best > 0.0) break;
         }
-        // Strategy 2: SurfaceFlinger --latency-frameinfo (Android 12+ —
-        // may work on devices where --latency returns no rows, e.g.
-        // SoloX#303 / Android 15/16 regression)
-        for (const auto& candidate : candidates) {
-            auto frames = getLayerFrameInfo(candidate);
-            if (frames.empty()) continue;
-            double fps = computeFpsFromLatencyFrames(frames);
-            if (fps > 0.0) {
-                if (outSource) *outSource = FpsSource::SURFACEFLINGER_LATENCY;
-                LOGD("FPS via SurfaceFlinger --latency-frameinfo \"%s\": %.2f", candidate.c_str(), fps);
-                return fps;
-            }
+        if (best >= 0.0) {
+            if (outSource) *outSource = FpsSource::SURFACEFLINGER_LATENCY;
+            LOGD("FPS via SurfaceFlinger --latency: %.2f", best);
+            return best;
         }
     }
 
-    auto blocks = parseGfxInfoFrameStats(gfxInfoDump(packageName));
-    double maxFps = -1.0;
-    for (const auto& completions : blocks) {
-        if (completions.size() >= 2) {
-            double fps = fpsFromSortedTimestampsNanos(completions);
-            if (fps > maxFps) maxFps = fps;
-        }
-    }
-    if (maxFps > 0.0) {
+    double maxFps = gfxinfoFps(parseGfxInfoFrameStats(gfxInfoDump(packageName)));
+    if (maxFps >= 0.0) {
         if (outSource) *outSource = FpsSource::GFXINFO;
         LOGD("FPS via gfxinfo framestats for \"%s\": %.2f", packageName.c_str(), maxFps);
         return maxFps;
@@ -685,22 +639,30 @@ JNI_FUNC(jstring, nativeGetLastFpsSource)(JNIEnv* env, jobject) {
 // Fetch the privileged text yourself (however your existing shell
 // collection already does it) and hand it here for parsing only:
 //   dumpsys SurfaceFlinger --list
-//   dumpsys SurfaceFlinger --latency "<name from nativeFindLayerForPackage>"
-//   dumpsys SurfaceFlinger --latency-frameinfo "<layer>"       (Android 12+)
+//   dumpsys SurfaceFlinger --latency "<name from nativeFindLayersForPackage>"
 //   dumpsys gfxinfo <package> framestats
 
-JNI_FUNC(jstring, nativeFindLayerForPackage)(JNIEnv* env, jobject,
-                                              jstring jListDumpText, jstring jPackageName) {
-    if (!jListDumpText || !jPackageName) return env->NewStringUTF("");
-    const char* listC = env->GetStringUTFChars(jListDumpText, nullptr);
-    const char* pkgC = env->GetStringUTFChars(jPackageName, nullptr);
-    std::string listDump = listC ? listC : "";
-    std::string pkg = pkgC ? pkgC : "";
-    if (listC) env->ReleaseStringUTFChars(jListDumpText, listC);
-    if (pkgC) env->ReleaseStringUTFChars(jPackageName, pkgC);
-
-    auto candidates = findLayerCandidatesForPackage(listDump, pkg);
-    return env->NewStringUTF(candidates.empty() ? "" : candidates.front().c_str());
+// All ranked candidates (BLAST SurfaceView, SurfaceView, window); callers try each in order.
+JNI_FUNC(jobjectArray, nativeFindLayersForPackage)(JNIEnv* env, jobject,
+                                                   jstring jListDumpText, jstring jPackageName) {
+    std::vector<std::string> candidates;
+    if (jListDumpText && jPackageName) {
+        const char* listC = env->GetStringUTFChars(jListDumpText, nullptr);
+        const char* pkgC = env->GetStringUTFChars(jPackageName, nullptr);
+        std::string listDump = listC ? listC : "";
+        std::string pkg = pkgC ? pkgC : "";
+        if (listC) env->ReleaseStringUTFChars(jListDumpText, listC);
+        if (pkgC) env->ReleaseStringUTFChars(jPackageName, pkgC);
+        if (!pkg.empty()) candidates = findLayerCandidatesForPackage(listDump, pkg);
+    }
+    jclass stringClass = env->FindClass("java/lang/String");
+    jobjectArray result = env->NewObjectArray(static_cast<jsize>(candidates.size()), stringClass, nullptr);
+    for (size_t i = 0; i < candidates.size(); i++) {
+        jstring str = env->NewStringUTF(candidates[i].c_str());
+        env->SetObjectArrayElement(result, static_cast<jsize>(i), str);
+        env->DeleteLocalRef(str);
+    }
+    return result;
 }
 
 JNI_FUNC(jdouble, nativeFpsFromLatencyText)(JNIEnv* env, jobject, jstring jLatencyText) {
@@ -720,26 +682,32 @@ JNI_FUNC(jdouble, nativeFpsFromGfxinfoText)(JNIEnv* env, jobject, jstring jGfxin
     std::string text = c ? c : "";
     if (c) env->ReleaseStringUTFChars(jGfxinfoText, c);
 
-    auto blocks = parseGfxInfoFrameStats(text);
-    double maxFps = -1.0;
-    for (const auto& completions : blocks) {
-        if (completions.size() >= 2) {
-            double fps = fpsFromSortedTimestampsNanos(completions);
-            if (fps > maxFps) maxFps = fps;
-        }
-    }
-    return maxFps > 0.0 ? maxFps : -1.0;
+    return gfxinfoFps(parseGfxInfoFrameStats(text));
 }
 
-JNI_FUNC(jdouble, nativeFpsFromLatencyFrameinfoText)(JNIEnv* env, jobject, jstring jFrameinfoText) {
-    if (!jFrameinfoText) return -1.0;
-    const char* c = env->GetStringUTFChars(jFrameinfoText, nullptr);
-    std::string text = c ? c : "";
-    if (c) env->ReleaseStringUTFChars(jFrameinfoText, c);
-
-    auto frames = parseLatencyFrameinfo(text);
-    if (frames.empty()) return -1.0;
-    return computeFpsFromLatencyFrames(frames);
+// Sorted present timestamps (ns) for frame-time stats: from `--latency` text,
+// or, with gfxinfo=true, the largest gfxinfo framestats block. Empty = no data.
+JNI_FUNC(jlongArray, nativePresentTimesFromText)(JNIEnv* env, jobject, jstring jText, jboolean gfxinfo) {
+    std::vector<int64_t> times;
+    if (jText) {
+        const char* c = env->GetStringUTFChars(jText, nullptr);
+        std::string text = c ? c : "";
+        if (c) env->ReleaseStringUTFChars(jText, c);
+        if (gfxinfo) {
+            for (auto& block : parseGfxInfoFrameStats(text)) {
+                if (block.size() > times.size()) times = std::move(block);
+            }
+        } else {
+            for (const auto& f : parseLatency(text)) times.push_back(f.presentedNanos);
+            std::sort(times.begin(), times.end());
+        }
+    }
+    jlongArray result = env->NewLongArray(static_cast<jsize>(times.size()));
+    if (result && !times.empty()) {
+        env->SetLongArrayRegion(result, 0, static_cast<jsize>(times.size()),
+                                 reinterpret_cast<const jlong*>(times.data()));
+    }
+    return result;
 }
 
 // --- Legacy/compat exports (kept so existing Kotlin call sites still link) -
@@ -750,7 +718,7 @@ JNI_FUNC(jdouble, nativeFpsFromLatencyFrameinfoText)(JNIEnv* env, jobject, jstri
 // everything else is real.
 JNI_FUNC(jobjectArray, nativeGetActiveLayers)(JNIEnv* env, jobject) {
     std::string listDump = sfDump({"--list"});
-    static const std::regex svRegex(R"(SurfaceView\[[^\]]*\]#\d+)");
+    static const std::regex svRegex(R"(SurfaceView\[[^\]'"]*\](\(BLAST\))?#\d+)");
     static const std::regex plainRegex(R"([A-Za-z0-9_.]+/[A-Za-z0-9_.$]+#\d+)");
 
     std::vector<std::string> entries;

@@ -86,6 +86,13 @@ class GpuFrequencyDiscoveryTest {
         assertTrue(result.sources.isEmpty())
     }
 
+    @Test fun knownPointsWithMixedUnitsNormalizeToHz() {
+        // GED current freq in kHz next to devfreq min/max in Hz: same OPP must not appear twice
+        val path = "/sys/class/devfreq/13000000.mali"
+        val result = discover(path, emptyMap(), known = listOf(390000L, 390000000L, 1400000000L, 850L))
+        assertEquals(FrequencyCapability.Discrete(listOf(390000000L, 850000000L, 1400000000L)), result.capability)
+    }
+
     @Test fun noSourceReturnsUnavailable() {
         val result = discover("/sys/class/devfreq/gpu", emptyMap())
         assertTrue(result.capability is FrequencyCapability.Unavailable)

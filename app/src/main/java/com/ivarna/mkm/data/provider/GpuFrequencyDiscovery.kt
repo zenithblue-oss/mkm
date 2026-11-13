@@ -40,7 +40,7 @@ object GpuFrequencyDiscovery {
             )
         }
 
-        val known = FrequencyCapabilityParser.normalizeLongs(knownPoints)
+        val known = knownPointsHz(knownPoints)
         return GpuFrequencyDiscoveryResult(
             capability = if (known.isNotEmpty()) FrequencyCapability.Discrete(known)
             else FrequencyCapability.Unavailable("No GPU frequency table is exposed by this kernel"),
@@ -48,6 +48,13 @@ object GpuFrequencyDiscovery {
             knownPointsOnly = known.isNotEmpty()
         )
     }
+
+    /**
+     * Observed points mix units (GED/gpufreq report kHz, devfreq Hz, kgsl gpuclk Hz);
+     * table sources are normalized to Hz, so known points must be too.
+     */
+    internal fun knownPointsHz(points: Iterable<Long>): List<Long> =
+        FrequencyCapabilityParser.normalizeLongs(points.filter { it > 0L }.map { GpuProvider.rawFrequencyToKhz(it) * 1000L })
 
     private fun standardPaths(path: String): List<String> = buildList {
         addAll(listOf(
