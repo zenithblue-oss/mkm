@@ -1,0 +1,5 @@
+Fixed overlay FPS, battery temperature, update interval and charging power sign.
+Much lower MKM battery drain; overlay pauses when the screen is off.
+CPU limits snap to supported frequencies; theme, language and Shizuku state are saved.
+New: overlay and Game Boost Quick Settings tiles, per-app auto boost, governor tunables, core control, zram/VM tunables, UFS health, swap manager, battery health and charge limit, FPS lows and export, profile import/export.
+Many safety fixes.

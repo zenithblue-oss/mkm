@@ -1,3 +1,4 @@
+import java.time.Instant
 import java.time.ZoneOffset
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
@@ -19,8 +20,8 @@ android {
         applicationId = "com.ivarna.mkm"
         minSdk = 24
         targetSdk = 37
-        versionCode = 10
-        versionName = "1.9"
+        versionCode = 11
+        versionName = "1.10"
         ndkVersion = "29.0.14206865"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -28,10 +29,17 @@ android {
             useSupportLibrary = true
         }
 
-        // Build date injected at configuration time (e.g. "September 04, 2026").
-        // Read in-app via AppBuildInfo / BuildConfig.BUILD_TIME so Settings
-        // always shows the actual build's version, versionCode and date.
-        val buildTime = ZonedDateTime.now(ZoneOffset.UTC)
+        // Build date shown in Settings via AppBuildInfo / BuildConfig.BUILD_TIME
+        // (e.g. "September 04, 2026"). Taken from SOURCE_DATE_EPOCH or the last
+        // commit's date, not the wall clock, so F-Droid reproducible builds of
+        // the same tag produce an identical APK. Falls back to "now" without git.
+        val buildEpoch = System.getenv("SOURCE_DATE_EPOCH")?.toLongOrNull()
+            ?: runCatching {
+                providers.exec { commandLine("git", "log", "-1", "--format=%ct") }
+                    .standardOutput.asText.get().trim().toLong()
+            }.getOrNull()
+        val buildTime = (buildEpoch?.let { Instant.ofEpochSecond(it).atZone(ZoneOffset.UTC) }
+            ?: ZonedDateTime.now(ZoneOffset.UTC))
             .format(DateTimeFormatter.ofPattern("MMMM dd, yyyy", Locale.ENGLISH))
         buildConfigField("String", "BUILD_TIME", "\"$buildTime\"")
 
