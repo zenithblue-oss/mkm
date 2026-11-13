@@ -38,6 +38,10 @@ import com.ivarna.mkm.data.model.UfsStatus
 import com.ivarna.mkm.ui.components.InfoRow
 import com.ivarna.mkm.ui.components.SectionHeader
 import com.ivarna.mkm.ui.components.SwapConfigDialog
+import com.ivarna.mkm.ui.components.ConfirmDialog
+import com.ivarna.mkm.ui.components.ManagedSwapFilesCard
+import com.ivarna.mkm.ui.components.ZramVmCard
+import com.ivarna.mkm.shell.ShellScripts
 import com.ivarna.mkm.ui.viewmodel.RamViewModel
 import com.ivarna.mkm.ui.components.BootToggleCard
 
@@ -51,21 +55,33 @@ fun RamScreen(viewModel: RamViewModel = viewModel(), onOpenDrawer: () -> Unit = 
     val bootEnabled by viewModel.bootEnabled.collectAsState()
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
     
-    var showSwapDialog by remember { mutableStateOf(false) }
+    val showSwapDialog by viewModel.showSwapDialog.collectAsState()
+    val zram by viewModel.zram.collectAsState()
+    val swapFiles by viewModel.swapFiles.collectAsState()
+    // (isDelete, path) awaiting confirmation
+    var pendingSwapAction by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
 
     if (showSwapDialog) {
         val currentSwap = uiState?.swap
-        val defaultPath = "/data/local/tmp/swapfile"
-        // Don't suggest /dev/block paths (zram) as they are not safe/valid for file creation
-        val suggestion = currentSwap?.path?.takeIf { it != "None" && !it.startsWith("/dev/") } ?: defaultPath
-        
+        // Only regular /data swap files are valid suggestions (never zram / block devices)
+        val suggestion = currentSwap?.path?.takeIf { ShellScripts.isValidSwapPath(it) } ?: ShellScripts.DEFAULT_SWAP_PATH
+
         SwapConfigDialog(
             initialSize = if (currentSwap?.isActive == true && currentSwap.path == suggestion) 1024 else 2048,
             initialPath = suggestion,
-            onDismiss = { showSwapDialog = false },
+            onDismiss = { viewModel.dismissSwapDialog() },
             onConfirm = { path, size ->
                 viewModel.applySwap(path, size)
             }
+        )
+    }
+
+    pendingSwapAction?.let { (isDelete, path) ->
+        ConfirmDialog(
+            title = stringResource(if (isDelete) com.ivarna.mkm.R.string.mem_confirm_delete_swap_title else com.ivarna.mkm.R.string.mem_confirm_disable_swap_title),
+            message = stringResource(if (isDelete) com.ivarna.mkm.R.string.mem_confirm_delete_swap_msg else com.ivarna.mkm.R.string.mem_confirm_disable_swap_msg, path),
+            onConfirm = { if (isDelete) viewModel.removeSwap(path) else viewModel.disableSwap(path) },
+            onDismiss = { pendingSwapAction = null }
         )
     }
 
@@ -94,7 +110,7 @@ fun RamScreen(viewModel: RamViewModel = viewModel(), onOpenDrawer: () -> Unit = 
             },
             floatingActionButton = {
                 ExtendedFloatingActionButton(
-                    onClick = { showSwapDialog = true },
+                    onClick = { viewModel.openSwapDialog() },
                     icon = { Icon(Icons.Default.Add, contentDescription = null) },
                     text = { Text(stringResource(com.ivarna.mkm.R.string.create_new_swap)) },
                     containerColor = MaterialTheme.colorScheme.primaryContainer,
@@ -154,17 +170,38 @@ fun RamScreen(viewModel: RamViewModel = viewModel(), onOpenDrawer: () -> Unit = 
                         SectionHeader(stringResource(com.ivarna.mkm.R.string.swap_configuration))
                         SwapConfigurationCard(
                             swap = data.swap,
-                            onConfigureClick = { showSwapDialog = true },
-                            onDisableClick = { viewModel.disableSwap(data.swap.path) },
-                            onRemoveClick = { path -> viewModel.removeSwap(path) }
+                            onConfigureClick = { viewModel.openSwapDialog() },
+                            onDisableClick = { pendingSwapAction = false to data.swap.path },
+                            onRemoveClick = { path -> pendingSwapAction = true to path }
                         )
-                        
+
+                        if (swapFiles.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(16.dp))
+                            ManagedSwapFilesCard(
+                                files = swapFiles,
+                                onEnable = { viewModel.enableSwap(it) },
+                                onDisable = { pendingSwapAction = false to it },
+                                onDelete = { pendingSwapAction = true to it }
+                            )
+                        }
+
+                        zram?.let { z ->
+                            Spacer(modifier = Modifier.height(24.dp))
+                            SectionHeader(stringResource(com.ivarna.mkm.R.string.mem_zram_vm_title))
+                            ZramVmCard(
+                                zram = z,
+                                onVmApply = { name, value -> viewModel.setVmTunable(name, value) },
+                                onZramApply = { algo, sizeMb -> viewModel.reconfigureZram(algo, sizeMb) }
+                            )
+                        }
+
                         Spacer(modifier = Modifier.height(24.dp))
                         SectionHeader(stringResource(com.ivarna.mkm.R.string.ddr_frequency_tuning))
                         DevfreqTuningCard(
                             devfreq = data.devfreq,
                             onGovernorSelected = { path, gov -> viewModel.setDevfreqGovernor(path, gov) },
-                            onFreqSelected = { path, freq -> viewModel.setDevfreqFreq(path, freq) }
+                            onFreqSelected = { path, freq -> viewModel.setDevfreqFreq(path, freq) },
+                            onReset = { path -> viewModel.resetDevfreq(path) }
                         )
                         
                         Spacer(modifier = Modifier.height(24.dp))
@@ -357,7 +394,7 @@ fun SwapDeviceRow(device: SwapDeviceInfo, onRemove: () -> Unit) {
                 )
             }
             
-            if (device.type == "file") {
+            if (ShellScripts.isValidSwapPath(device.path)) {
                 IconButton(onClick = onRemove) {
                     Icon(
                         imageVector = Icons.Default.Delete,
@@ -479,7 +516,8 @@ fun LoadingOverlay(message: String) {
 fun DevfreqTuningCard(
     devfreq: com.ivarna.mkm.data.model.DevfreqStatus,
     onGovernorSelected: (String, String) -> Unit,
-    onFreqSelected: (String, String) -> Unit
+    onFreqSelected: (String, String) -> Unit,
+    onReset: (String) -> Unit = {}
 ) {
     ElevatedCard(
         modifier = Modifier.fillMaxWidth(),
@@ -563,7 +601,7 @@ fun DevfreqTuningCard(
                     Spacer(modifier = Modifier.height(8.dp))
                     
                     Text(
-                        text = stringResource(com.ivarna.mkm.R.string.current_freq_format, devfreq.currentFreq),
+                        text = stringResource(com.ivarna.mkm.R.string.current_freq_format, com.ivarna.mkm.utils.ShellUtils.formatHz(devfreq.currentFreq)),
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.Bold
                     )
@@ -601,7 +639,7 @@ fun DevfreqTuningCard(
                         OutlinedTextField(
                             modifier = Modifier.menuAnchor().fillMaxWidth(),
                             readOnly = true,
-                            value = devfreq.currentFreq.takeIf { it != "0" && it.isNotBlank() } ?: stringResource(com.ivarna.mkm.R.string.set_specific_frequency),
+                            value = devfreq.currentFreq.takeIf { it != "0" && it.isNotBlank() }?.let(com.ivarna.mkm.utils.ShellUtils::formatHz) ?: stringResource(com.ivarna.mkm.R.string.set_specific_frequency),
                             onValueChange = {},
                             label = { Text(stringResource(com.ivarna.mkm.R.string.force_frequency_userspace)) },
                             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = freqExpanded) },
@@ -613,7 +651,7 @@ fun DevfreqTuningCard(
                         ) {
                             devfreq.availableFrequencies.forEach { freq ->
                                 DropdownMenuItem(
-                                    text = { Text(freq) },
+                                    text = { Text(com.ivarna.mkm.utils.ShellUtils.formatHz(freq)) },
                                     onClick = {
                                         onFreqSelected(devfreq.controllerPath, freq)
                                         freqExpanded = false
@@ -622,6 +660,10 @@ fun DevfreqTuningCard(
                                 )
                             }
                         }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedButton(onClick = { onReset(devfreq.controllerPath) }, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(com.ivarna.mkm.R.string.mem_devfreq_reset))
                     }
                 }
 

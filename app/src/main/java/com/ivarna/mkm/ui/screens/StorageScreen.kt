@@ -23,6 +23,9 @@ import com.ivarna.mkm.ui.components.PullToRefreshWrapper
 import com.ivarna.mkm.ui.components.StatCard
 import com.ivarna.mkm.ui.components.HeroUsageCard
 import com.ivarna.mkm.ui.components.UfsTuningCard
+import com.ivarna.mkm.ui.components.UfsHealthCard
+import com.ivarna.mkm.ui.components.IoTuningCard
+import androidx.compose.ui.Alignment
 import com.ivarna.mkm.ui.viewmodel.StorageViewModel
 import com.ivarna.mkm.R
 import com.ivarna.mkm.ui.components.BootToggleCard
@@ -33,8 +36,14 @@ fun StorageScreen(viewModel: StorageViewModel = viewModel(), onOpenDrawer: () ->
     val uiState by viewModel.uiState.collectAsState()
     val isRefreshing by viewModel.isRefreshing.collectAsState()
     val bootEnabled by viewModel.bootEnabled.collectAsState()
+    val isProcessing by viewModel.isProcessing.collectAsState()
+    val errorMessage by viewModel.errorMessage.collectAsState()
+    val infoMessage by viewModel.infoMessage.collectAsState()
+    val health by viewModel.health.collectAsState()
+    val blockDevices by viewModel.blockDevices.collectAsState()
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
+    Box(modifier = Modifier.fillMaxSize()) {
     Scaffold(
         modifier = Modifier.fillMaxSize(),
         topBar = {
@@ -68,6 +77,27 @@ fun StorageScreen(viewModel: StorageViewModel = viewModel(), onOpenDrawer: () ->
                     .padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
+                (errorMessage ?: infoMessage)?.let { msg ->
+                    val isError = errorMessage != null
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (isError) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.secondaryContainer
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = msg,
+                                color = if (isError) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSecondaryContainer,
+                                modifier = Modifier.weight(1f)
+                            )
+                            TextButton(onClick = { viewModel.clearError() }) {
+                                Text(stringResource(com.ivarna.mkm.R.string.dismiss))
+                            }
+                        }
+                    }
+                }
+
                 uiState?.let { state ->
                     BootToggleCard(
                         enabled = bootEnabled,
@@ -104,6 +134,15 @@ fun StorageScreen(viewModel: StorageViewModel = viewModel(), onOpenDrawer: () ->
                         onMaxFreqSelected = { path, freq -> viewModel.setUfsMaxFreq(path, freq) }
                     )
 
+                    UfsHealthCard(health)
+
+                    IoTuningCard(
+                        devices = blockDevices,
+                        onScheduler = { dev, s -> viewModel.setScheduler(dev, s) },
+                        onReadAhead = { dev, kb -> viewModel.setReadAhead(dev, kb) },
+                        onFstrim = { viewModel.runFstrim() }
+                    )
+
                     Card(
                         shape = RoundedCornerShape(32.dp),
                         colors = CardDefaults.cardColors(
@@ -131,6 +170,10 @@ fun StorageScreen(viewModel: StorageViewModel = viewModel(), onOpenDrawer: () ->
                     }
                 }
             }
+        }
+    }
+        if (isProcessing) {
+            LoadingOverlay(message = stringResource(com.ivarna.mkm.R.string.processing_ellipsis))
         }
     }
 }
