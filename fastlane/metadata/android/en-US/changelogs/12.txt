@@ -1,0 +1,2 @@
+Reproducible build fix for F-Droid: the native library libfpsbinder is now built without an NDK build-id and without absolute source paths.
+The app now has separate F-Droid and Google Play builds. The Play build no longer links to an external Shizuku APK download; the F-Droid build keeps the Download Shizuku button.
