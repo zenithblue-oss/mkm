@@ -128,16 +128,19 @@ fun PermissionRequestScreen(
                         style = MaterialTheme.typography.bodyMedium,
                         textAlign = TextAlign.Center
                     )
-                    Spacer(modifier = Modifier.height(24.dp))
-                    Button(
-                        onClick = {
-                            val intent = Intent(Intent.ACTION_VIEW).apply {
-                                data = Uri.parse("https://github.com/RikkaApps/Shizuku/releases")
+                    // Play policy forbids linking to an external APK download; only the F-Droid build shows it.
+                    if (com.ivarna.mkm.BuildConfig.SHOW_SHIZUKU_DOWNLOAD) {
+                        Spacer(modifier = Modifier.height(24.dp))
+                        Button(
+                            onClick = {
+                                val intent = Intent(Intent.ACTION_VIEW).apply {
+                                    data = Uri.parse("https://github.com/RikkaApps/Shizuku/releases")
+                                }
+                                context.startActivity(intent)
                             }
-                            context.startActivity(intent)
+                        ) {
+                            Text(stringResource(com.ivarna.mkm.R.string.download_shizuku))
                         }
-                    ) {
-                        Text(stringResource(com.ivarna.mkm.R.string.download_shizuku))
                     }
                 }
 

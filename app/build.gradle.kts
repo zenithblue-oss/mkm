@@ -50,6 +50,19 @@ android {
         }
     }
 
+    // fdroid: F-Droid / GitHub APK. play: Google Play (no external APK download links).
+    flavorDimensions += "store"
+    productFlavors {
+        create("fdroid") {
+            dimension = "store"
+            buildConfigField("boolean", "SHOW_SHIZUKU_DOWNLOAD", "true")
+        }
+        create("play") {
+            dimension = "store"
+            buildConfigField("boolean", "SHOW_SHIZUKU_DOWNLOAD", "false")
+        }
+    }
+
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
